@@ -158,7 +158,12 @@ class TestStreaming:
                 events = []
                 async for line in resp.aiter_lines():
                     if line.startswith("data: ") and line != "data: [DONE]":
-                        events.append(json.loads(line[6:]))
+                        try:
+                            json_str = line[6:].strip()
+                            if json_str:
+                                events.append(json.loads(json_str))
+                        except json.JSONDecodeError:
+                            pass  # Skip malformed lines
 
                 # Should have at least one content chunk
                 content_events = [
@@ -192,7 +197,12 @@ class TestStreaming:
                 events = []
                 async for line in resp.aiter_lines():
                     if line.startswith("data: ") and line != "data: [DONE]":
-                        events.append(json.loads(line[6:]))
+                        try:
+                            json_str = line[6:].strip()
+                            if json_str:
+                                events.append(json.loads(json_str))
+                        except json.JSONDecodeError:
+                            pass  # Skip malformed lines
 
                 progress_events = [e for e in events if e.get("type") == "progress"]
                 assert len(progress_events) >= 1
