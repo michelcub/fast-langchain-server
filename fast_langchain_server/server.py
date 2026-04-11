@@ -1,0 +1,622 @@
+"""
+Core HTTP server for LangChain / LangGraph agents.
+
+Architecture
+------------
+AgentServer wraps any CompiledStateGraph (created with
+``langchain.agents.create_agent`` or a custom LangGraph graph) and exposes it
+as a production-grade HTTP service.
+
+Endpoints
+---------
+GET  /health                     – liveness probe
+GET  /ready                      – readiness probe
+POST /v1/chat/completions        – OpenAI-compatible chat (streaming + non-streaming)
+GET  /.well-known/agent.json     – A2A discovery card
+GET  /memory/sessions            – list active sessions
+DELETE /memory/sessions/{id}     – delete a session
+POST /                           – A2A JSON-RPC 2.0  (SendMessage/GetTask/CancelTask)
+                                   only mounted when task_manager_type != "none"
+
+Streaming
+---------
+LangGraph astream() is called with ``stream_mode=["messages","updates"]``.
+  "messages" events  → forward LLM tokens to the SSE client in real time.
+  "updates"  events  → capture full new messages for session memory.
+
+OpenTelemetry
+-------------
+A span is created for every /v1/chat/completions request.  Parent context is
+extracted from incoming headers (W3C TraceContext) so distributed traces are
+continued end-to-end.  Span attributes include session_id, stream mode, and
+tool-call count.
+
+A2A
+---
+When task_manager_type="local" the JSON-RPC 2.0 endpoint is mounted at
+POST /.  The task manager calls the server's own _process_fn, giving A2A
+clients the same agent behaviour as the chat API.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import time
+import uuid
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any, Optional, Tuple
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from langchain_core.messages import AIMessageChunk, HumanMessage
+from opentelemetry import trace as trace_api
+from pydantic import BaseModel
+from sse_starlette.sse import EventSourceResponse
+
+from fast_langchain_server.a2a import (
+    LocalTaskManager,
+    NullTaskManager,
+    TaskManager,
+    setup_a2a_routes,
+)
+from fast_langchain_server.memory import Memory, NullMemory, create_memory
+from fast_langchain_server.serverutils import (
+    AgentServerSettings,
+    build_langchain_model,
+    configure_logging,
+    extract_text_content,
+)
+from fast_langchain_server.telemetry import (
+    SERVICE_NAME,
+    extract_context,
+    init_otel,
+    is_otel_enabled,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Request / response models
+# ---------------------------------------------------------------------------
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatCompletionRequest(BaseModel):
+    messages: list[ChatMessage]
+    model: str = "agent"
+    stream: bool = False
+    session_id: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# AgentServer
+# ---------------------------------------------------------------------------
+
+
+class AgentServer:
+    """Wraps a compiled LangGraph/LangChain agent with a production HTTP server.
+
+    Parameters
+    ----------
+    agent:
+        A ``CompiledStateGraph`` from ``langchain.agents.create_agent(...)``
+        or any LangGraph graph that accepts ``{"messages": [...]}`` input and
+        returns ``{"messages": [...]}`` in its state.
+    settings:
+        Server configuration (all fields env-var driven).
+    memory:
+        Session message-history backend.
+    tools:
+        LangChain tools exposed on the discovery card.  Not used for execution.
+    task_manager:
+        A2A task manager.  ``NullTaskManager`` disables A2A.
+    """
+
+    def __init__(
+        self,
+        agent: Any,
+        settings: AgentServerSettings,
+        memory: Optional[Memory] = None,
+        tools: Optional[list] = None,
+        task_manager: Optional[TaskManager] = None,
+    ) -> None:
+        self._agent = agent
+        self._settings = settings
+        self._memory: Memory = memory or NullMemory()
+        self._tools: list = tools or []
+        self._task_manager: TaskManager = task_manager or NullTaskManager()
+
+        self._app = FastAPI(
+            title=settings.agent_name,
+            description=settings.agent_description,
+            lifespan=self._lifespan,
+        )
+        self._setup_routes()
+
+    # ── Lifespan ──────────────────────────────────────────────────────────────
+
+    @asynccontextmanager
+    async def _lifespan(self, app: FastAPI):
+        # Initialise OTel (idempotent — safe to call even if already done)
+        if self._settings.otel_active:
+            init_otel(self._settings.agent_name)
+
+        a2a_active = not isinstance(self._task_manager, NullTaskManager)
+        logger.info(
+            "Agent '%s' starting on port %d (memory=%s otel=%s a2a=%s)",
+            self._settings.agent_name,
+            self._settings.agent_port,
+            self._settings.memory_type,
+            is_otel_enabled(),
+            a2a_active,
+        )
+
+        # ── Autonomous execution ──────────────────────────────────────────
+        # If AUTONOMOUS_GOAL is set and a LocalTaskManager is available,
+        # kick off the autonomous loop as a background task at startup.
+        if self._settings.autonomous_goal and a2a_active:
+            from fast_langchain_server.a2a import AutonomousConfig
+
+            auto_cfg = AutonomousConfig(
+                goal=self._settings.autonomous_goal,
+                interval_seconds=self._settings.autonomous_interval_seconds,
+                max_iter_runtime_seconds=self._settings.autonomous_max_iter_runtime_seconds,
+            )
+            logger.info(
+                "Starting autonomous loop: goal='%s' interval=%ds",
+                self._settings.autonomous_goal[:80],
+                self._settings.autonomous_interval_seconds,
+            )
+            await self._task_manager.submit_autonomous(
+                goal=self._settings.autonomous_goal,
+                autonomous_config=auto_cfg,
+            )
+        elif self._settings.autonomous_goal and not a2a_active:
+            logger.warning(
+                "AUTONOMOUS_GOAL is set but TASK_MANAGER_TYPE=none — "
+                "autonomous loop will not start. Set TASK_MANAGER_TYPE=local."
+            )
+
+        yield
+
+        logger.info("Agent '%s' shutting down", self._settings.agent_name)
+        await self._task_manager.shutdown()
+        await self._memory.close()
+
+    # ── Route setup ───────────────────────────────────────────────────────────
+
+    def _setup_routes(self) -> None:
+        app = self._app
+
+        # ── Health / Readiness ────────────────────────────────────────────────
+        @app.get("/health")
+        @app.get("/ready")
+        async def health():
+            return {
+                "status": "healthy",
+                "name": self._settings.agent_name,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+
+        # ── Agent discovery card ──────────────────────────────────────────────
+        @app.get("/.well-known/agent.json")
+        async def agent_card():
+            return self._build_agent_card()
+
+        # ── Chat completions (OpenAI-compatible) ──────────────────────────────
+        @app.post("/v1/chat/completions")
+        async def chat_completions(request: Request):
+            try:
+                body = await request.json()
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+            req = ChatCompletionRequest(**body)
+
+            last_user = next(
+                (m.content for m in reversed(req.messages) if m.role == "user"), None
+            )
+            if not last_user:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Request must contain at least one user message",
+                )
+
+            session_id = req.session_id or request.headers.get("X-Session-ID")
+            session_id = await self._memory.get_or_create_session(session_id)
+
+            # Extract parent W3C trace context from incoming headers
+            parent_ctx = extract_context(dict(request.headers))
+
+            if req.stream:
+                return EventSourceResponse(
+                    self._stream_response(last_user, session_id, req.model, parent_ctx),
+                    media_type="text/event-stream",
+                )
+
+            response_text, tool_call_count = await self._run_agent(
+                last_user, session_id, parent_ctx
+            )
+            return JSONResponse(
+                self._build_completion(response_text, session_id, req.model)
+            )
+
+        # ── Memory management ─────────────────────────────────────────────────
+        @app.get("/memory/sessions")
+        async def list_sessions():
+            sessions = await self._memory.list_sessions()
+            return {"sessions": sessions, "count": len(sessions)}
+
+        @app.delete("/memory/sessions/{session_id}")
+        async def delete_session(session_id: str):
+            deleted = await self._memory.delete_session(session_id)
+            if not deleted:
+                raise HTTPException(status_code=404, detail="Session not found")
+            return {"deleted": session_id}
+
+        # ── A2A JSON-RPC (only when task manager is active) ───────────────────
+        if not isinstance(self._task_manager, NullTaskManager):
+            setup_a2a_routes(app, self._task_manager)
+            logger.info("A2A JSON-RPC endpoint mounted at POST /")
+
+    # ── Non-streaming execution ───────────────────────────────────────────────
+
+    async def _run_agent(
+        self, user_input: str, session_id: str, parent_ctx=None
+    ) -> Tuple[str, int]:
+        """Run the agent and return (response_text, tool_call_count)."""
+        tracer = trace_api.get_tracer(SERVICE_NAME)
+
+        with tracer.start_as_current_span(
+            "fls.server.run",
+            context=parent_ctx,
+            attributes={
+                "agent.name": self._settings.agent_name,
+                "session.id": session_id,
+                "stream": False,
+            },
+        ) as span:
+            history = await self._memory.get_messages(
+                session_id, self._settings.memory_context_limit
+            )
+            input_messages = history + [HumanMessage(content=user_input)]
+
+            try:
+                result = await self._agent.ainvoke({"messages": input_messages})
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_attribute("error", True)
+                logger.error("Agent invocation failed: %s", exc, exc_info=True)
+                raise HTTPException(status_code=500, detail=f"Agent error: {exc}") from exc
+
+            all_messages = result.get("messages", [])
+            if not all_messages:
+                raise HTTPException(status_code=500, detail="Agent returned no messages")
+
+            await self._memory.save_messages(session_id, all_messages)
+
+            final = all_messages[-1]
+            response_text = extract_text_content(final.content)
+
+            # Count tool calls in the new messages (everything after input)
+            new_msgs = all_messages[len(input_messages):]
+            tool_call_count = sum(
+                len(getattr(m, "tool_calls", None) or []) for m in new_msgs
+            )
+            span.set_attribute("tool_calls", tool_call_count)
+            return response_text, tool_call_count
+
+    # ── Streaming execution ───────────────────────────────────────────────────
+
+    async def _stream_response(
+        self, user_input: str, session_id: str, model: str, parent_ctx=None
+    ) -> AsyncGenerator[str, None]:
+        """
+        Async generator that yields SSE-formatted strings.
+
+        SSE events
+        ~~~~~~~~~~
+        Progress (tool call detected):
+            data: {"type": "progress", "action": "tool_call", "target": "<name>"}
+
+        Content chunk (LLM token):
+            data: {"id": "…", "object": "chat.completion.chunk",
+                   "choices": [{"index": 0, "delta": {"content": "…"}, "finish_reason": null}]}
+
+        End of stream:
+            data: [DONE]
+        """
+        tracer = trace_api.get_tracer(SERVICE_NAME)
+
+        # The span must stay open across the whole generator, so we use a
+        # context-manager approach without 'with' (enter/exit manually).
+        span = tracer.start_span(
+            "fls.server.stream",
+            context=parent_ctx,
+            attributes={
+                "agent.name": self._settings.agent_name,
+                "session.id": session_id,
+                "stream": True,
+            },
+        )
+
+        history = await self._memory.get_messages(
+            session_id, self._settings.memory_context_limit
+        )
+        input_messages = history + [HumanMessage(content=user_input)]
+        response_id = str(uuid.uuid4())
+        accumulated_new: list = []
+        announced_tools: set[str] = set()
+        total_tool_calls = 0
+
+        try:
+            async for mode, data in self._agent.astream(
+                {"messages": input_messages},
+                stream_mode=["messages", "updates"],
+            ):
+                if mode == "messages":
+                    chunk, _metadata = data
+
+                    if isinstance(chunk, AIMessageChunk):
+                        # Detect and announce new tool calls
+                        for tc in chunk.tool_call_chunks or []:
+                            tool_name = tc.get("name", "")
+                            if tool_name and tool_name not in announced_tools:
+                                announced_tools.add(tool_name)
+                                total_tool_calls += 1
+                                progress = {
+                                    "type": "progress",
+                                    "action": "tool_call",
+                                    "target": tool_name,
+                                }
+                                yield f"data: {json.dumps(progress)}\n\n"
+
+                        # Stream LLM tokens
+                        if chunk.content:
+                            sse = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {
+                                            "content": extract_text_content(chunk.content)
+                                        },
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(sse)}\n\n"
+
+                elif mode == "updates":
+                    for _node, node_output in data.items():
+                        for msg in node_output.get("messages", []):
+                            accumulated_new.append(msg)
+
+            await self._memory.save_messages(
+                session_id, input_messages + accumulated_new
+            )
+
+            span.set_attribute("tool_calls", total_tool_calls)
+            yield "data: [DONE]\n\n"
+
+        except Exception as exc:
+            span.record_exception(exc)
+            span.set_attribute("error", True)
+            logger.error("Streaming error: %s", exc, exc_info=True)
+            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+        finally:
+            span.end()
+
+    # ── process_fn for A2A task manager ──────────────────────────────────────
+
+    async def _process_fn(self, text: str, session_id: str) -> Tuple[str, int]:
+        """Bridge between the A2A task manager and the agent.
+
+        The task manager calls this function with each iteration message and
+        expects ``(response_text, tool_call_count)``.
+        """
+        return await self._run_agent(text, session_id)
+
+    # ── Agent discovery card ──────────────────────────────────────────────────
+
+    def _build_agent_card(self) -> dict:
+        skills = [
+            {
+                "id": getattr(t, "name", str(t)),
+                "name": getattr(t, "name", str(t)),
+                "description": getattr(t, "description", ""),
+                "inputModes": ["application/json"],
+                "outputModes": ["application/json"],
+            }
+            for t in self._tools
+        ]
+
+        a2a_active = not isinstance(self._task_manager, NullTaskManager)
+
+        return {
+            "name": self._settings.agent_name,
+            "description": self._settings.agent_description,
+            "url": f"http://localhost:{self._settings.agent_port}",
+            "version": "0.1.0",
+            "protocolVersion": "0.3.0",
+            "skills": skills,
+            "capabilities": {
+                "streaming": True,
+                "memory": self._settings.memory_enabled,
+                "memoryBackend": self._settings.memory_type,
+                "a2a": a2a_active,
+                "pushNotifications": False,
+                "stateTransitionHistory": a2a_active,
+            },
+            "supportedProtocols": ["jsonrpc"] if a2a_active else [],
+            "defaultInputModes": ["application/json"],
+            "defaultOutputModes": ["application/json"],
+        }
+
+    # ── OpenAI response builder ───────────────────────────────────────────────
+
+    @staticmethod
+    def _build_completion(content: str, session_id: str, model: str) -> dict:
+        return {
+            "id": session_id,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    @property
+    def app(self) -> FastAPI:
+        return self._app
+
+    def run(self, host: str = "0.0.0.0") -> None:
+        import uvicorn
+        uvicorn.run(
+            self._app,
+            host=host,
+            port=self._settings.agent_port,
+            log_level=self._settings.agent_log_level.lower(),
+            access_log=self._settings.agent_access_log,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+
+def create_agent_server(
+    settings: Optional[AgentServerSettings] = None,
+    tools: Optional[list] = None,
+    custom_agent: Any = None,
+    system_prompt: Optional[str] = None,
+) -> AgentServer:
+    """Build a fully wired AgentServer from environment variables.
+
+    Parameters
+    ----------
+    settings:
+        Pre-built settings.  Loaded from env vars / .env when ``None``.
+    tools:
+        LangChain tools to attach.  Ignored when ``custom_agent`` is provided.
+    custom_agent:
+        An already-compiled LangGraph/LangChain agent (``CompiledStateGraph``).
+        When provided, model and agent creation are skipped.
+    system_prompt:
+        Override the system prompt from settings.  Ignored when
+        ``custom_agent`` is provided.
+
+    Examples
+    --------
+    # Everything from env vars
+    server = create_agent_server(tools=[my_tool])
+    server.run()
+
+    # With a pre-built agent
+    from langchain.agents import create_agent
+    agent = create_agent("openai:gpt-4o", tools=[my_tool])
+    server = create_agent_server(custom_agent=agent, tools=[my_tool])
+    server.run()
+    """
+    if settings is None:
+        settings = AgentServerSettings()  # type: ignore[call-arg]
+
+    configure_logging(settings.agent_log_level, otel_correlation=settings.otel_active)
+
+    # ── OTel (early init so factory logging is traced) ────────────────────────
+    if settings.otel_active:
+        init_otel(settings.agent_name)
+
+    # ── Memory backend ────────────────────────────────────────────────────────
+    memory = create_memory(
+        memory_type=settings.memory_type if settings.memory_enabled else "null",
+        redis_url=settings.memory_redis_url,
+        max_sessions=settings.memory_max_sessions,
+        max_messages_per_session=settings.memory_max_messages_per_session,
+    )
+
+    # ── Agent ─────────────────────────────────────────────────────────────────
+    if custom_agent is not None:
+        agent = custom_agent
+        logger.info("Using provided agent: %s", type(agent).__name__)
+    else:
+        from langchain.agents import create_agent as lc_create_agent
+
+        model = build_langchain_model(settings)
+        prompt = system_prompt or settings.agent_instructions
+
+        logger.info(
+            "Creating agent '%s' with %d tool(s)", settings.agent_name, len(tools or [])
+        )
+        agent = lc_create_agent(
+            model=model,
+            tools=tools or [],
+            system_prompt=prompt,
+        )
+
+    # ── A2A task manager ──────────────────────────────────────────────────────
+    # We need a forward reference to the server's _process_fn, so we build a
+    # placeholder and wire it after the server is created.
+    server = AgentServer(
+        agent=agent,
+        settings=settings,
+        memory=memory,
+        tools=tools or [],
+        task_manager=NullTaskManager(),  # replaced below if needed
+    )
+
+    if settings.task_manager_type == "local":
+        tm = LocalTaskManager(
+            process_fn=server._process_fn,
+            max_tasks=settings.task_manager_max_tasks,
+        )
+        server._task_manager = tm
+        setup_a2a_routes(server.app, tm)
+        logger.info("A2A LocalTaskManager wired (max_tasks=%d)", settings.task_manager_max_tasks)
+
+    return server
+
+
+# ---------------------------------------------------------------------------
+# ASGI factory entry point
+# ---------------------------------------------------------------------------
+
+
+def get_app() -> FastAPI:
+    """ASGI factory used by: uvicorn fast_langchain_server.server:get_app --factory"""
+    return create_agent_server().app
+
+
+def serve(agent: Any, tools: Optional[list] = None, **kwargs: Any) -> FastAPI:
+    """One-liner to wrap an existing agent as a FastAPI ASGI app.
+
+    Example
+    -------
+    from langchain.agents import create_agent
+    from fast_langchain_server import serve
+
+    agent = create_agent("openai:gpt-4o", tools=[my_tool])
+    app = serve(agent, tools=[my_tool])
+    """
+    settings = AgentServerSettings(**kwargs) if kwargs else AgentServerSettings()  # type: ignore[call-arg]
+    server = create_agent_server(settings=settings, custom_agent=agent, tools=tools or [])
+    return server.app
