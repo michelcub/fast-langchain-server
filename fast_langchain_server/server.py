@@ -488,7 +488,7 @@ class AgentServer:
     def app(self) -> FastAPI:
         return self._app
 
-    def run(self, host: str = "0.0.0.0") -> None:
+    def run(self, host: str = "0.0.0.0") -> None:  # nosec B104 - intentional for containerized deployment
         import uvicorn
         uvicorn.run(
             self._app,
