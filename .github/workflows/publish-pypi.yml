@@ -1,6 +1,10 @@
 name: Publish to PyPI
 
 on:
+  push:
+    branches:
+      - develop
+      - main
   release:
     types: [created, published]
   workflow_dispatch:
@@ -41,14 +45,20 @@ jobs:
         run: twine check dist/*
 
       - name: Publish to TestPyPI
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'testpypi' || (github.event_name == 'release' && github.event.action == 'created')
+        if: |
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'testpypi') ||
+          (github.event_name == 'release' && github.event.action == 'created') ||
+          (github.event_name == 'push' && github.ref == 'refs/heads/develop')
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: https://test.pypi.org/legacy/
           password: ${{ secrets.TEST_PYPI_API_TOKEN }}
 
       - name: Publish to PyPI
-        if: github.event_name == 'release' && github.event.action == 'published'
+        if: |
+          (github.event_name == 'release' && github.event.action == 'published') ||
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'pypi') ||
+          (github.event_name == 'push' && github.ref == 'refs/heads/main')
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
