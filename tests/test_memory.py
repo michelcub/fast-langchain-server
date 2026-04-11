@@ -272,8 +272,9 @@ def _make_redis_mock(_store: dict | None = None, _zset: dict | None = None) -> M
                     r = await delete(*op[1])
                     results.append(r)
                 elif op[0] == "zrem":
+                    before = len(_zset)
                     await zrem(op[1], *op[2])
-                    results.append(1)
+                    results.append(before - len(_zset))
             pipeline_ops.clear()
             return results
 

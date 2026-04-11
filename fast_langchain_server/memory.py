@@ -267,7 +267,7 @@ class RedisMemory(Memory):
         pipe.delete(self._session_key(session_id))
         pipe.zrem(self._index_key, session_id)
         results = await pipe.execute()
-        return bool(results[0])
+        return any(bool(r) for r in results)
 
     async def close(self) -> None:
         await self._redis.aclose()
