@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from httpx import AsyncClient
+from httpx import AsyncClient, ASGITransport
 
 from fast_langchain_server.memory import LocalMemory, NullMemory
 from fast_langchain_server.server import AgentServer
@@ -143,7 +143,7 @@ class TestChatCompletions:
 class TestStreaming:
     @pytest.mark.asyncio
     async def test_streaming_returns_sse_events(self, server: AgentServer):
-        async with AsyncClient(app=server.app, base_url="http://test") as ac:
+        async with AsyncClient(transport=ASGITransport(app=server.app), base_url="http://test") as ac:
             async with ac.stream(
                 "POST",
                 "/v1/chat/completions",
@@ -178,7 +178,7 @@ class TestStreaming:
         agent = _make_mock_agent_with_tool()
         server = AgentServer(agent=agent, settings=settings, memory=memory)
 
-        async with AsyncClient(app=server.app, base_url="http://test") as ac:
+        async with AsyncClient(transport=ASGITransport(app=server.app), base_url="http://test") as ac:
             async with ac.stream(
                 "POST",
                 "/v1/chat/completions",
