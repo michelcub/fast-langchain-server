@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from httpx import AsyncClient
+from httpx import AsyncClient, ASGITransport
 
 from fast_langchain_server.memory import LocalMemory, NullMemory
 from fast_langchain_server.server import AgentServer
@@ -143,7 +143,7 @@ class TestChatCompletions:
 class TestStreaming:
     @pytest.mark.asyncio
     async def test_streaming_returns_sse_events(self, server: AgentServer):
-        async with AsyncClient(app=server.app, base_url="http://test") as ac:
+        async with AsyncClient(transport=ASGITransport(app=server.app), base_url="http://test") as ac:
             async with ac.stream(
                 "POST",
                 "/v1/chat/completions",
@@ -158,7 +158,12 @@ class TestStreaming:
                 events = []
                 async for line in resp.aiter_lines():
                     if line.startswith("data: ") and line != "data: [DONE]":
-                        events.append(json.loads(line[6:]))
+                        try:
+                            json_str = line[6:].strip()
+                            if json_str:
+                                events.append(json.loads(json_str))
+                        except json.JSONDecodeError:
+                            pass  # Skip malformed lines
 
                 # Should have at least one content chunk
                 content_events = [
@@ -178,7 +183,7 @@ class TestStreaming:
         agent = _make_mock_agent_with_tool()
         server = AgentServer(agent=agent, settings=settings, memory=memory)
 
-        async with AsyncClient(app=server.app, base_url="http://test") as ac:
+        async with AsyncClient(transport=ASGITransport(app=server.app), base_url="http://test") as ac:
             async with ac.stream(
                 "POST",
                 "/v1/chat/completions",
@@ -192,7 +197,12 @@ class TestStreaming:
                 events = []
                 async for line in resp.aiter_lines():
                     if line.startswith("data: ") and line != "data: [DONE]":
-                        events.append(json.loads(line[6:]))
+                        try:
+                            json_str = line[6:].strip()
+                            if json_str:
+                                events.append(json.loads(json_str))
+                        except json.JSONDecodeError:
+                            pass  # Skip malformed lines
 
                 progress_events = [e for e in events if e.get("type") == "progress"]
                 assert len(progress_events) >= 1

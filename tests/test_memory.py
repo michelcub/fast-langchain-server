@@ -192,13 +192,15 @@ class TestLocalMemory:
 # ---------------------------------------------------------------------------
 
 
-def _make_redis_mock() -> MagicMock:
+def _make_redis_mock(_store: dict | None = None, _zset: dict | None = None) -> MagicMock:
     """Return a mock that behaves like a minimal aioredis client."""
     redis = MagicMock()
 
-    # Internal store
-    _store: dict[str, str] = {}
-    _zset: dict[str, float] = {}
+    # Internal store - create fresh if not provided
+    if _store is None:
+        _store: dict[str, str] = {}
+    if _zset is None:
+        _zset: dict[str, float] = {}
 
     async def get(key):
         return _store.get(key)
@@ -270,8 +272,9 @@ def _make_redis_mock() -> MagicMock:
                     r = await delete(*op[1])
                     results.append(r)
                 elif op[0] == "zrem":
+                    before = len(_zset)
                     await zrem(op[1], *op[2])
-                    results.append(1)
+                    results.append(before - len(_zset))
             pipeline_ops.clear()
             return results
 
@@ -292,8 +295,11 @@ def _make_redis_mock() -> MagicMock:
 @pytest.fixture
 def redis_memory():
     """RedisMemory with a fully mocked aioredis client."""
+    # Create fresh storage for each test to avoid state pollution
+    fresh_store = {}
+    fresh_zset = {}
     mem = RedisMemory.__new__(RedisMemory)
-    mem._redis = _make_redis_mock()
+    mem._redis = _make_redis_mock(_store=fresh_store, _zset=fresh_zset)
     mem._max_sessions = 100
     mem._max_msgs = 500
     mem._PREFIX = "fls"

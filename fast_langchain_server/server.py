@@ -49,7 +49,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.messages import AIMessageChunk, HumanMessage
 from opentelemetry import trace as trace_api
 from pydantic import BaseModel
@@ -236,9 +236,10 @@ class AgentServer:
             parent_ctx = extract_context(dict(request.headers))
 
             if req.stream:
-                return EventSourceResponse(
+                return StreamingResponse(
                     self._stream_response(last_user, session_id, req.model, parent_ctx),
                     media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                 )
 
             response_text, tool_call_count = await self._run_agent(
@@ -488,7 +489,7 @@ class AgentServer:
     def app(self) -> FastAPI:
         return self._app
 
-    def run(self, host: str = "0.0.0.0") -> None:
+    def run(self, host: str = "0.0.0.0") -> None:  # nosec B104 - intentional for containerized deployment
         import uvicorn
         uvicorn.run(
             self._app,

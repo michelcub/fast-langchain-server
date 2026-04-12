@@ -124,7 +124,7 @@ def run(
         "agent.py",
         help="Python file (or file:attr / module:attr) containing the agent",
     ),
-    host: str = typer.Option("0.0.0.0", "--host", "-H", help="Bind host"),
+    host: str = typer.Option("0.0.0.0", "--host", "-H", help="Bind host"),  # nosec B104 - intentional for containerized deployment
     port: Optional[int] = typer.Option(None, "--port", "-p", help="Bind port (overrides AGENT_PORT)"),
     reload: bool = typer.Option(False, "--reload", "-r", help="Auto-reload on file changes"),
 ) -> None:

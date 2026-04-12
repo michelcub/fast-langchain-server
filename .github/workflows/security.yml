@@ -1,0 +1,138 @@
+name: Security Checks
+
+on:
+  push:
+    branches:
+      - develop
+      - main
+  pull_request:
+    branches:
+      - develop
+      - main
+  schedule:
+    # Ejecuta diariamente a las 2 AM UTC
+    - cron: '0 2 * * *'
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  dependency-check:
+    name: Check Dependencies for Vulnerabilities
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install project dependencies and tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pip-audit
+
+      - name: Audit Python dependencies
+        run: |
+          echo "🔍 Analizando dependencias..."
+          pip-audit --desc
+        continue-on-error: true
+
+  bandit-scan:
+    name: Scan Code for Security Issues
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install bandit
+        run: pip install bandit
+
+      - name: Run Bandit security scan
+        run: |
+          echo "🔒 Escaneando código para problemas de seguridad..."
+          bandit -r fast_langchain_server/ -f json -o bandit-report.json || true
+          bandit -r fast_langchain_server/ -f txt
+
+      - name: Upload Bandit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report
+          path: bandit-report.json
+
+  safety-check:
+    name: Check for Known Security Vulnerabilities
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install safety
+
+      - name: Run Safety check
+        run: |
+          echo "⚠️  Verificando vulnerabilidades conocidas..."
+          safety check --json
+        continue-on-error: true
+
+  codeql-analysis:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v2
+        with:
+          languages: 'python'
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v2
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v2
+
+  license-check:
+    name: Check Dependencies Licenses
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-licenses
+
+      - name: Check licenses
+        run: |
+          echo "📜 Analizando licencias de dependencias..."
+          pip-licenses --format=markdown --with-urls
