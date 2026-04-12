@@ -643,24 +643,50 @@ def get_app() -> FastAPI:
     return create_agent_server().app
 
 
-def serve(agent: Any, tools: Optional[list] = None, **kwargs: Any) -> FastAPI:
+def serve(
+    agent: Any,
+    tools: Optional[list] = None,
+    agent_name: Optional[str] = None,
+    agent_description: Optional[str] = None,
+    **kwargs: Any
+) -> FastAPI:
     """One-liner to wrap an existing agent as a FastAPI ASGI app.
+
+    Parameters
+    ----------
+    agent : CompiledStateGraph
+        A LangChain/LangGraph agent (from create_agent()).
+    tools : list, optional
+        List of tools to expose in the agent discovery card.
+    agent_name : str, optional
+        Name for the agent. Falls back to AGENT_NAME env var or auto-generated.
+    agent_description : str, optional
+        Description for the agent. Falls back to AGENT_DESCRIPTION env var.
+    **kwargs
+        Additional settings passed to AgentServerSettings.
 
     Example
     -------
     from langchain.agents import create_agent
     from fast_langchain_server import serve
 
-    agent = create_agent("openai:gpt-4o", tools=[my_tool])
-    app = serve(agent, tools=[my_tool])
+    agent = create_agent(model=model, tools=[my_tool])
+    app = serve(
+        agent,
+        tools=[my_tool],
+        agent_name="my-agent",
+        agent_description="My custom agent"
+    )
     """
     # Extract model info from agent if not provided in kwargs
     if not kwargs:
         kwargs = _extract_agent_settings(agent)
 
-    # Extract tools from agent if not provided explicitly
-    if tools is None:
-        tools = _extract_tools_from_agent(agent)
+    # Allow overriding agent name and description via parameters
+    if agent_name:
+        kwargs["agent_name"] = agent_name
+    if agent_description:
+        kwargs["agent_description"] = agent_description
 
     settings = AgentServerSettings(**kwargs)  # type: ignore[call-arg]
     server = create_agent_server(settings=settings, custom_agent=agent, tools=tools or [])
@@ -707,60 +733,6 @@ def _extract_agent_settings(agent: Any) -> dict[str, Any]:
         settings["agent_name"] = agent_name
 
     return settings
-
-
-def _extract_tools_from_agent(agent: Any) -> list[Any]:
-    """Extract tools from a LangChain agent.
-
-    Attempts to find tools in the agent's graph structure.
-    """
-    tools = []
-
-    try:
-        # Try to extract from agent nodes
-        if hasattr(agent, "nodes"):
-            for node_name, node_data in agent.nodes.items():
-                if hasattr(node_data, "runnable"):
-                    runnable = node_data.runnable
-                    # Look for bind_tools call with tools
-                    extracted = _find_tools_in_runnable(runnable)
-                    if extracted:
-                        tools.extend(extracted)
-    except Exception as e:
-        logger.debug(f"Could not auto-extract tools from agent: {e}")
-
-    return tools
-
-
-def _find_tools_in_runnable(runnable: Any) -> list[Any]:
-    """Recursively search a runnable for tools."""
-    tools = []
-
-    if runnable is None:
-        return tools
-
-    # Check if this is a tool-bound model (has kwargs with tools)
-    if hasattr(runnable, "kwargs") and "tools" in runnable.kwargs:
-        tools.extend(runnable.kwargs["tools"])
-        return tools
-
-    # Check nested runnables
-    if hasattr(runnable, "first"):
-        tools.extend(_find_tools_in_runnable(runnable.first))
-    if hasattr(runnable, "middle"):
-        if isinstance(runnable.middle, list):
-            for item in runnable.middle:
-                tools.extend(_find_tools_in_runnable(item))
-        else:
-            tools.extend(_find_tools_in_runnable(runnable.middle))
-    if hasattr(runnable, "last"):
-        tools.extend(_find_tools_in_runnable(runnable.last))
-
-    if hasattr(runnable, "steps"):
-        for step in runnable.steps:
-            tools.extend(_find_tools_in_runnable(step))
-
-    return tools
 
 
 def _extract_model_from_runnable(runnable: Any, settings: dict[str, Any]) -> bool:
