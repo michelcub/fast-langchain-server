@@ -4,22 +4,23 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue)](https://www.python.org/downloads/)
-[![PyPI version](https://img.shields.io/badge/version-0.4.1-brightgreen)](https://pypi.org/project/fast-langchain-server/)
+[![PyPI version](https://img.shields.io/badge/version-0.5.0-brightgreen)](https://pypi.org/project/fast-langchain-server/)
 
 ## Overview
 
-**Fast LangChain Server** transforms any LangChain/LangGraph agent into a production-ready HTTP service. Deploy with a single line of code and get streaming responses, automatic session management, pluggable authentication, a composable middleware chain, and built-in observability.
+**Fast LangChain Server** transforms any LangChain/LangGraph agent into a production-ready HTTP service. Instantiate `Server`, call `run()` — or expose `server.app` to any ASGI server.
 
 ## Features
 
+- **Single entry point** — one class (`Server`) to create, configure, and run
 - **OpenAI-Compatible API** — Drop-in compatible with OpenAI clients (`/v1/chat/completions`)
 - **Streaming** — Real-time token streaming via Server-Sent Events (SSE)
 - **Session Memory** — Conversation history with local or Redis backends
 - **Authentication** — Pluggable `AuthProvider`: API keys, JWT Bearer tokens, or compose multiple via `|`
-- **Middleware** — Composable chain with built-ins: `AuthMiddleware`, `TimingMiddleware`, `RateLimitMiddleware`
+- **Middleware** — Composable chain: `AgentMiddleware` instances go through the internal chain; Starlette/ASGI classes go to `app.add_middleware()`
 - **Authorization** — Per-endpoint `AuthCheck` rules with built-ins: `require_scopes`, `allow_own_session`, etc.
 - **Lifespan** — Composable startup/shutdown lifecycle via `@lifespan` decorator and `|` operator
-- **A2A Protocol** — Agent-to-Agent JSON-RPC 2.0 with autonomous execution support
+- **A2A Protocol** — Agent-to-Agent JSON-RPC 2.0 with autonomous execution support (enabled by default)
 - **OpenTelemetry** — Distributed tracing with W3C TraceContext propagation
 - **Production Ready** — Health checks, structured logging, Docker-ready
 
@@ -40,7 +41,7 @@ pip install fast-langchain-server
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
-from fast_langchain_server import serve
+from fast_langchain_server import Server
 import os
 
 @tool
@@ -48,7 +49,6 @@ def add(a: float, b: float) -> float:
     """Add two numbers."""
     return a + b
 
-# Create model
 model = ChatOpenAI(
     model=os.getenv("MODEL_NAME"),
     api_key=os.getenv("MODEL_API_KEY"),
@@ -57,18 +57,19 @@ model = ChatOpenAI(
 
 agent = create_agent(model=model, tools=[add])
 
-# Wrap with serve() - pass tools to expose in agent discovery
-app = serve(
+server = Server(
     agent,
     tools=[add],
     agent_name="my-agent",
-    agent_description="A helpful assistant with math capabilities"
+    agent_description="A helpful assistant with math capabilities",
 )
+
+# Expose for uvicorn / gunicorn
+app = server.app
 ```
 
 Configure environment variables in `.env`:
 ```bash
-AGENT_NAME=my-agent
 MODEL_NAME=gpt-4o
 MODEL_API_URL=https://api.openai.com/v1
 MODEL_API_KEY=sk-...
@@ -79,93 +80,62 @@ Run:
 uvicorn agent:app
 ```
 
+Or run directly from code:
+```python
+if __name__ == "__main__":
+    server.run()                    # uses AGENT_PORT / default 8000
+    server.run(port=9000)           # explicit port
+    server.run(port=9000, reload=True)  # dev mode
+```
+
 ### CLI
 
 ```bash
-# Auto-discover the agent in agent.py and start the server
+# Auto-discover a Server instance or agent in agent.py
 fast-langchain-server run agent.py
 
 # Explicit attribute
-fast-langchain-server run agent.py:app
+fast-langchain-server run agent.py:server --port 9000 --reload
 ```
 
-### Configuring the agent
+---
 
-The `serve()` function provides several ways to configure your agent:
+## Server configuration
 
-#### Model configuration (auto-extracted)
-
-The model configuration is automatically extracted from your LangChain agent:
+All constructor parameters fall back to environment variables when not provided:
 
 ```python
-from langchain_openai import ChatOpenAI
-from langchain.agents import create_agent
-from fast_langchain_server import serve
-
-# Model configured once
-model = ChatOpenAI(
-    model="gpt-4o",
-    api_key="sk-...",
-    base_url="https://api.openai.com/v1",
-)
-
-agent = create_agent(model=model, tools=[...])
-
-# serve() extracts model config automatically
-app = serve(agent)
-```
-
-#### Agent identity (name & description)
-
-Customize how your agent appears in discovery:
-
-```python
-app = serve(
-    agent,
-    tools=[my_tool],
-    agent_name="my-agent",
-    agent_description="A helpful assistant"
+server = Server(
+    agent,                                    # required
+    tools=[add, search],                      # exposed in discovery card
+    agent_name="my-agent",                    # AGENT_NAME env var
+    agent_description="Does math and search", # AGENT_DESCRIPTION env var
+    a2a=True,                                 # enable A2A JSON-RPC (default True)
+    lifespan=DEFAULT_LIFESPAN | my_lifespan,  # composable startup/shutdown
+    memory=my_memory_backend,                 # inject a custom Memory instance
+    # any AgentServerSettings field:
+    agent_port=9000,                          # AGENT_PORT
+    memory_type="redis",                      # MEMORY_TYPE
+    memory_redis_url="redis://localhost:6379",
 )
 ```
 
-#### Tools & skills
+### run() parameters
 
-Pass tools explicitly to expose them in the agent discovery card:
+`run()` accepts all `uvicorn.run()` keyword arguments:
 
 ```python
-app = serve(
-    agent,
-    tools=[add, multiply, search],  # Tools appear in /.well-known/agent.json
+server.run(
+    host="0.0.0.0",
+    port=8080,
+    reload=True,           # dev only — incompatible with workers
+    workers=4,
+    log_level="warning",
+    access_log=True,
+    ssl_keyfile="key.pem",
+    ssl_certfile="cert.pem",
 )
 ```
-
-#### Environment fallback
-
-If not provided as parameters, settings are read from environment:
-```bash
-AGENT_NAME=my-agent
-AGENT_DESCRIPTION="A helpful assistant"
-MODEL_NAME=gpt-4o
-MODEL_API_URL=https://api.openai.com/v1
-MODEL_API_KEY=sk-...
-```
-
-#### A2A (Agent-to-Agent) support
-
-A2A protocol is **enabled by default**, allowing other agents to communicate with yours:
-
-```python
-# A2A enabled (default)
-app = serve(agent, tools=[my_tool])  # a2a=True
-
-# Disable A2A if not needed
-app = serve(agent, tools=[my_tool], a2a=False)
-```
-
-When A2A is enabled:
-- **`POST /`** endpoint is available for A2A JSON-RPC 2.0 communication
-- **Autonomous execution** support for multi-agent workflows
-- **Agent discovery card** shows `a2a: true` and `supportedProtocols: ["jsonrpc"]`
 
 ---
 
@@ -179,7 +149,7 @@ When A2A is enabled:
 | `GET` | `/.well-known/agent.json` | A2A agent discovery card |
 | `GET` | `/memory/sessions` | List active sessions |
 | `DELETE` | `/memory/sessions/{id}` | Delete a session |
-| `POST` | `/` | A2A JSON-RPC 2.0 *(enabled by default, set `a2a=False` to disable)* |
+| `POST` | `/` | A2A JSON-RPC 2.0 *(when `a2a=True`, default)* |
 
 ### Chat completions
 
@@ -187,98 +157,52 @@ When A2A is enabled:
 # Non-streaming
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{
-    "messages": [{"role": "user", "content": "What is 2+2?"}],
-    "model": "agent"
-  }'
-```
+  -d '{"messages": [{"role": "user", "content": "What is 2+2?"}]}'
 
-```bash
 # Streaming
 curl -N -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{
-    "messages": [{"role": "user", "content": "Tell me a joke"}],
-    "stream": true
-  }'
+  -d '{"messages": [{"role": "user", "content": "Tell me a joke"}], "stream": true}'
 ```
 
-**Session continuity** — pass `session_id` in the body or via `X-Session-ID` header to continue a conversation:
+Pass `session_id` in the body or via `X-Session-ID` header to continue a conversation:
 
 ```bash
 curl -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
   -d '{"messages": [{"role": "user", "content": "And 3+3?"}], "session_id": "abc123"}'
 ```
 
 ### Agent discovery card
 
-The `/.well-known/agent.json` endpoint provides machine-readable metadata about your agent, including its tools/skills:
-
 ```bash
 curl http://localhost:8000/.well-known/agent.json | jq
 ```
 
-Response:
 ```json
 {
   "name": "math-agent",
   "description": "A helpful math agent",
   "url": "http://localhost:8000",
-  "version": "0.3.0",
-  "protocolVersion": "0.3.0",
-  "skills": [
-    {
-      "id": "add",
-      "name": "add",
-      "description": "Add two numbers.",
-      "inputModes": ["application/json"],
-      "outputModes": ["application/json"]
-    },
-    {
-      "id": "multiply",
-      "name": "multiply",
-      "description": "Multiply two numbers.",
-      "inputModes": ["application/json"],
-      "outputModes": ["application/json"]
-    }
-  ],
-  "capabilities": {
-    "streaming": true,
-    "memory": true,
-    "memoryBackend": "local",
-    "a2a": false,
-    "pushNotifications": false,
-    "stateTransitionHistory": false
-  },
-  "supportedProtocols": [],
-  "defaultInputModes": ["application/json"],
-  "defaultOutputModes": ["application/json"]
+  "skills": [{"id": "add", "name": "add", "description": "Add two numbers."}],
+  "capabilities": {"streaming": true, "memory": true, "a2a": true}
 }
 ```
 
-**Skills** are automatically populated from the `tools` parameter passed to `serve()`. Each tool's name and docstring become the skill's `name` and `description`.
+Skills are populated from the `tools` parameter. Each tool's name and docstring become the skill's `name` and `description`.
 
 ---
 
 ## Authentication
 
-Add token verification to every request with any `AuthProvider`:
-
 ```python
-from fast_langchain_server import (
-    create_agent_server,
-    AuthMiddleware,
-    EnvAPIKeyProvider,
-    JWTProvider,
-)
+from fast_langchain_server import Server, AuthMiddleware, EnvAPIKeyProvider, JWTProvider
 
-server = create_agent_server(tools=[...])
+server = Server(agent, tools=[...])
 
-# Option A: API keys from environment variable AGENT_API_KEYS=sk-a,sk-b
+# Option A: API keys from AGENT_API_KEYS env var (comma-separated)
 server.add_middleware(AuthMiddleware(provider=EnvAPIKeyProvider()))
 
-# Option B: JWT Bearer tokens validated against a JWKS endpoint
+# Option B: JWT Bearer tokens
 server.add_middleware(AuthMiddleware(
     provider=JWTProvider(
         jwks_url="https://auth.example.com/.well-known/jwks.json",
@@ -286,21 +210,19 @@ server.add_middleware(AuthMiddleware(
     )
 ))
 
-# Option C: compose both (JWT first, API key fallback)
+# Option C: compose providers (JWT first, API key fallback)
 server.add_middleware(AuthMiddleware(
     provider=JWTProvider(...) | EnvAPIKeyProvider()
 ))
 ```
 
-Requests must include the token in one of these headers:
-
+Requests must include the token in one of:
 ```
 Authorization: Bearer <token>
 X-API-Key: <token>
 ```
 
-The following endpoints are excluded from auth by default:
-`/health`, `/ready`, `/.well-known/agent.json`
+`/health`, `/ready`, `/.well-known/agent.json` are excluded from auth by default.
 
 ### Available providers
 
@@ -330,21 +252,23 @@ server.add_middleware(AuthMiddleware(provider=MyDatabaseProvider()))
 
 ## Middleware
 
-Middleware intercepts requests before and after the agent runs. Add them with `add_middleware()` — they execute in the order added (first = outermost).
+`add_middleware()` routes by type:
+- **`AgentMiddleware` instance** → added to the internal request-processing chain
+- **Any other class** → forwarded to `app.add_middleware()` (Starlette/ASGI level)
 
 ```python
-from fast_langchain_server import (
-    create_agent_server,
-    AuthMiddleware,
-    TimingMiddleware,
-    RateLimitMiddleware,
-    EnvAPIKeyProvider,
-)
+from fast_langchain_server import Server, AuthMiddleware, TimingMiddleware, RateLimitMiddleware, EnvAPIKeyProvider
+from starlette.middleware.cors import CORSMiddleware
 
-server = create_agent_server(tools=[...])
-server.add_middleware(TimingMiddleware())
-server.add_middleware(AuthMiddleware(provider=EnvAPIKeyProvider()))
-server.add_middleware(RateLimitMiddleware(max_rpm=60))
+server = Server(agent, tools=[...])
+
+(
+    server
+    .add_middleware(TimingMiddleware())
+    .add_middleware(AuthMiddleware(provider=EnvAPIKeyProvider()))
+    .add_middleware(RateLimitMiddleware(max_rpm=60))
+    .add_middleware(CORSMiddleware, allow_origins=["*"])  # ASGI-level
+)
 ```
 
 ### Built-in middlewares
@@ -362,7 +286,7 @@ from fast_langchain_server import AgentMiddleware
 
 class LoggingMiddleware(AgentMiddleware):
     async def on_request(self, ctx, call_next):
-        print(f"Request: session={ctx.session_id} input={ctx.user_input[:50]}")
+        print(f"Request: session={ctx.session_id}")
         result = await call_next(ctx)
         print(f"Done: session={ctx.session_id}")
         return result
@@ -370,7 +294,7 @@ class LoggingMiddleware(AgentMiddleware):
 server.add_middleware(LoggingMiddleware())
 ```
 
-**Hooks available:**
+**Hooks:**
 
 | Hook | When it runs |
 |------|-------------|
@@ -381,15 +305,8 @@ server.add_middleware(LoggingMiddleware())
 
 ## Authorization
 
-Separate from authentication — controls *what* an authenticated user can do.
-
 ```python
-from fast_langchain_server import (
-    AuthorizationMiddleware,
-    require_scopes,
-    allow_own_session,
-    all_of,
-)
+from fast_langchain_server import AuthorizationMiddleware, require_scopes, allow_own_session
 
 server.add_middleware(AuthorizationMiddleware({
     "/v1/chat/completions": require_scopes("chat"),
@@ -408,24 +325,12 @@ server.add_middleware(AuthorizationMiddleware({
 | `all_of(*checks)` | AND — all checks must pass |
 | `any_of(*checks)` | OR — at least one check must pass |
 
-### Custom check
-
-```python
-from fast_langchain_server.authorization import AuthContext
-
-def my_ip_allowlist(ctx: AuthContext) -> bool:
-    # ctx.token carries the verified AuthToken
-    return ctx.token and ctx.token.subject in ALLOWED_SUBJECTS
-```
-
 ---
 
 ## Lifespan
 
-Manage startup and shutdown of resources with composable lifecycle hooks.
-
 ```python
-from fast_langchain_server import create_agent_server, lifespan, DEFAULT_LIFESPAN
+from fast_langchain_server import Server, lifespan, DEFAULT_LIFESPAN
 
 @lifespan
 async def db_lifespan(server):
@@ -439,90 +344,87 @@ async def cache_lifespan(server):
     yield {}
     await server.lifespan_context["cache"].aclose()
 
-# Compose with | — enters left-to-right, exits right-to-left (LIFO)
-server = create_agent_server(
+server = Server(
+    agent,
     tools=[...],
     lifespan=DEFAULT_LIFESPAN | db_lifespan | cache_lifespan,
 )
 ```
 
-Access the context at runtime:
+Composes left-to-right (enters left first, exits right first — LIFO). `DEFAULT_LIFESPAN` handles OTel init, startup/shutdown logging, the autonomous loop, and graceful teardown.
+
+---
+
+## A2A Protocol
+
+Agent-to-Agent is **enabled by default** (`a2a=True`). Disable it with `a2a=False`:
 
 ```python
-db = server.lifespan_context["db"]
+server = Server(agent, tools=[...])          # a2a=True, POST / mounted
+server = Server(agent, tools=[...], a2a=False)  # no A2A endpoint
 ```
 
-`DEFAULT_LIFESPAN` includes OpenTelemetry init, startup/shutdown logging, the autonomous loop launcher, and graceful shutdown of memory and task manager.
+When enabled, the `/.well-known/agent.json` card includes `"a2a": true` and `"supportedProtocols": ["jsonrpc"]`.
 
 ---
 
 ## AgentContext
 
-Every request carries an `AgentContext` through the middleware chain and into the agent execution layer. Middlewares can read and enrich it:
+Available throughout the middleware chain and agent execution:
 
 ```python
 ctx.session_id      # resolved session identifier
-ctx.request_id      # UUID for this specific request
+ctx.request_id      # UUID for this request
 ctx.user_input      # last user message
 ctx.model           # model name from the request
 ctx.headers         # lowercased HTTP headers dict
 ctx.otel_context    # W3C TraceContext for distributed tracing
-ctx.auth_token      # AuthToken set by AuthMiddleware (or None)
-ctx.endpoint        # HTTP path ("/v1/chat/completions")
+ctx.auth_token      # set by AuthMiddleware (or None)
 
-ctx.set_meta("key", value)    # store custom data for downstream use
-ctx.get_meta("key", default)  # retrieve it
+ctx.set_meta("key", value)
+ctx.get_meta("key", default)
 
 await ctx.emit_progress("tool_call", "search_web")  # push SSE progress event
 ```
 
 ---
 
-## Configuration
+## Configuration reference
 
-All settings are driven by environment variables (or `.env` file):
+All settings fall back to environment variables:
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `AGENT_NAME` | ✓ | — | Agent identifier |
-| `MODEL_API_URL` | ✓ | — | LLM API base URL (OpenAI, Ollama, vLLM…) |
-| `MODEL_NAME` | ✓ | — | Model name (`gpt-4o`, `llama3.2`…) |
-| `MODEL_API_KEY` | — | `not-needed` | API key for the model endpoint |
-| `MODEL_TEMPERATURE` | — | `0.7` | Sampling temperature |
-| `MODEL_MAX_TOKENS` | — | *(none)* | Max tokens per response |
-| `AGENT_DESCRIPTION` | — | `"AI Agent"` | Human-readable description |
-| `AGENT_INSTRUCTIONS` | — | — | System prompt |
-| `AGENT_PORT` | — | `8000` | HTTP port |
-| `AGENT_LOG_LEVEL` | — | `INFO` | Log level |
-| `AGENT_ACCESS_LOG` | — | `false` | Enable uvicorn access log |
-| `MEMORY_ENABLED` | — | `true` | Enable session memory |
-| `MEMORY_TYPE` | — | `local` | `local` \| `redis` \| `null` |
-| `MEMORY_REDIS_URL` | For Redis | — | Redis connection URL |
-| `MEMORY_CONTEXT_LIMIT` | — | `20` | Messages to load per request |
-| `MEMORY_MAX_SESSIONS` | — | `1000` | Max sessions in local memory |
-| `AGENT_API_KEYS` | — | — | Comma-separated API keys (used by `EnvAPIKeyProvider`) |
-| `TASK_MANAGER_TYPE` | — | `none` | `none` \| `local` (enables A2A) |
-| `AUTONOMOUS_GOAL` | — | — | Goal for autonomous execution loop |
-| `AUTONOMOUS_INTERVAL_SECONDS` | — | `0` | Interval between autonomous runs |
-| `OTEL_ENABLED` | — | `false` | Enable OpenTelemetry |
-| `OTEL_SERVICE_NAME` | — | — | OTel service name |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | — | — | OTel collector endpoint |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AGENT_NAME` | auto-generated | Agent identifier |
+| `MODEL_API_URL` | — | LLM API base URL |
+| `MODEL_NAME` | — | Model name (`gpt-4o`, `llama3.2`…) |
+| `MODEL_API_KEY` | `not-needed` | API key |
+| `MODEL_TEMPERATURE` | `0.7` | Sampling temperature |
+| `AGENT_DESCRIPTION` | `"AI Agent"` | Human-readable description |
+| `AGENT_INSTRUCTIONS` | — | System prompt |
+| `AGENT_PORT` | `8000` | HTTP port |
+| `AGENT_LOG_LEVEL` | `INFO` | Log level |
+| `AGENT_ACCESS_LOG` | `false` | Uvicorn access log |
+| `MEMORY_ENABLED` | `true` | Enable session memory |
+| `MEMORY_TYPE` | `local` | `local` \| `redis` \| `null` |
+| `MEMORY_REDIS_URL` | — | Redis connection URL |
+| `MEMORY_CONTEXT_LIMIT` | `20` | Messages per request |
+| `AGENT_API_KEYS` | — | Comma-separated API keys (`EnvAPIKeyProvider`) |
+| `TASK_MANAGER_TYPE` | `local` | `local` \| `none` (overridden by `a2a=`) |
+| `AUTONOMOUS_GOAL` | — | Goal for autonomous execution loop |
+| `AUTONOMOUS_INTERVAL_SECONDS` | `0` | Interval between autonomous runs |
+| `OTEL_ENABLED` | `false` | Enable OpenTelemetry |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | — | OTel collector endpoint |
 
 ---
 
 ## Docker
 
 ```bash
-# Build
-docker build -t fast-langchain-server .
-
-# Run
 docker run -p 8000:8000 \
-  -e AGENT_NAME=my-agent \
   -e MODEL_API_URL=https://api.openai.com/v1 \
   -e MODEL_NAME=gpt-4o \
   -e MODEL_API_KEY=sk-... \
-  -e AGENT_API_KEYS=my-secret-key \
   -v $(pwd)/agent.py:/app/agent.py \
   fast-langchain-server
 ```
@@ -535,28 +437,28 @@ docker run -p 8000:8000 \
 HTTP Request
      │
      ▼
- [FastAPI]  — builds AgentContext(session_id, request_id, user_input, headers…)
+ [FastAPI app]  — builds AgentContext
      │
      ▼
- [AuthMiddleware]          verify token → ctx.auth_token
+ [AuthMiddleware]           verify token → ctx.auth_token
      │
      ▼
- [AuthorizationMiddleware] check scopes per endpoint
+ [AuthorizationMiddleware]  check scopes per endpoint
      │
      ▼
- [RateLimitMiddleware]     token bucket per session
+ [RateLimitMiddleware]      token bucket per session
      │
      ▼
- [TimingMiddleware]        measure elapsed time
+ [TimingMiddleware]         measure elapsed time
      │
      ▼
- [AgentServer._run_agent / _stream_response]
+ [Server._run_agent / _stream_response]
      │
      ▼
  [LangGraph agent.ainvoke / astream]
      │
      ▼
- [Memory backend]          save messages
+ [Memory backend]           save messages
      │
      ▼
  HTTP Response / SSE stream
@@ -566,7 +468,7 @@ HTTP Request
 
 | Module | Purpose |
 |--------|---------|
-| `server.py` | `AgentServer`, `create_agent_server`, `serve` |
+| `server.py` | `Server` — single entry point |
 | `context.py` | `AgentContext` — per-request state object |
 | `auth.py` | `AuthProvider`, `APIKeyProvider`, `EnvAPIKeyProvider`, `JWTProvider`, `MultiAuth` |
 | `middleware.py` | `AgentMiddleware`, `AuthMiddleware`, `TimingMiddleware`, `RateLimitMiddleware` |
@@ -582,17 +484,10 @@ HTTP Request
 ## Development
 
 ```bash
-# Install dev dependencies
-make dev
-
-# Run tests (185 tests)
-make test
-
-# Lint
-make lint
-
-# Run locally with hot-reload
-make run
+make dev     # install dev dependencies
+make test    # run tests (185 tests)
+make lint    # lint
+make run     # local hot-reload
 ```
 
 ---

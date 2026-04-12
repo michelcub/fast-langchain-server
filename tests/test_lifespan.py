@@ -19,7 +19,7 @@ from fast_langchain_server.lifespan import (
 
 
 def _make_server(**kwargs) -> MagicMock:
-    """Return a minimal mock of AgentServer for lifespan tests."""
+    """Return a minimal mock of Server for lifespan tests."""
     server = MagicMock()
     server._settings = MagicMock(
         otel_active=False,

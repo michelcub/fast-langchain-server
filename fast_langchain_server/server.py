@@ -3,9 +3,23 @@ Core HTTP server for LangChain / LangGraph agents.
 
 Architecture
 ------------
-AgentServer wraps any CompiledStateGraph (created with
+``Server`` wraps any CompiledStateGraph (created with
 ``langchain.agents.create_agent`` or a custom LangGraph graph) and exposes it
 as a production-grade HTTP service.
+
+Usage
+-----
+    from langchain.agents import create_agent
+    from fast_langchain_server import Server
+
+    agent = create_agent(model=model, tools=[add])
+    server = Server(agent, tools=[add], agent_name="my-agent")
+
+    # Run directly:
+    server.run()
+
+    # Or expose the FastAPI app for an external process manager:
+    app = server.app          # uvicorn agent:app
 
 Endpoints
 ---------
@@ -16,7 +30,7 @@ GET  /.well-known/agent.json     – A2A discovery card
 GET  /memory/sessions            – list active sessions
 DELETE /memory/sessions/{id}     – delete a session
 POST /                           – A2A JSON-RPC 2.0  (SendMessage/GetTask/CancelTask)
-                                   only mounted when task_manager_type != "none"
+                                   only mounted when a2a=True (default)
 
 Streaming
 ---------
@@ -33,9 +47,9 @@ tool-call count.
 
 A2A
 ---
-When task_manager_type="local" the JSON-RPC 2.0 endpoint is mounted at
-POST /.  The task manager calls the server's own _process_fn, giving A2A
-clients the same agent behaviour as the chat API.
+When a2a=True (default) the JSON-RPC 2.0 endpoint is mounted at POST /.
+The task manager calls the server's own _process_fn, giving A2A clients the
+same agent behaviour as the chat API.
 """
 from __future__ import annotations
 
@@ -98,12 +112,16 @@ class ChatCompletionRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# AgentServer
+# Server
 # ---------------------------------------------------------------------------
 
 
-class AgentServer:
-    """Wraps a compiled LangGraph/LangChain agent with a production HTTP server.
+class Server:
+    """Production HTTP server for a LangChain / LangGraph agent.
+
+    This is the single entry point for creating and running an agent server.
+    It wires together the FastAPI application, session memory, middleware chain,
+    A2A task manager, and OpenTelemetry tracing.
 
     Parameters
     ----------
@@ -111,40 +129,134 @@ class AgentServer:
         A ``CompiledStateGraph`` from ``langchain.agents.create_agent(...)``
         or any LangGraph graph that accepts ``{"messages": [...]}`` input and
         returns ``{"messages": [...]}`` in its state.
-    settings:
-        Server configuration (all fields env-var driven).
-    memory:
-        Session message-history backend.
     tools:
         LangChain tools exposed on the discovery card.  Not used for execution.
-    task_manager:
-        A2A task manager.  ``NullTaskManager`` disables A2A.
+    agent_name:
+        Display name for the agent.  Falls back to ``AGENT_NAME`` env var or
+        an auto-generated identifier.
+    agent_description:
+        Short description for the discovery card.  Falls back to
+        ``AGENT_DESCRIPTION`` env var.
+    a2a:
+        Enable Agent-to-Agent JSON-RPC 2.0 support (default ``True``).
+        Set to ``False`` to skip mounting the A2A endpoint.
+    lifespan:
+        Custom composable :class:`Lifespan` to use instead of (or composed
+        with) ``DEFAULT_LIFESPAN``::
+
+            from fast_langchain_server import Server, DEFAULT_LIFESPAN, lifespan
+
+            @lifespan
+            async def my_db(server):
+                server.lifespan_context["db"] = await connect()
+                yield {}
+                await server.lifespan_context["db"].close()
+
+            server = Server(agent, lifespan=DEFAULT_LIFESPAN | my_db)
+
+    **settings_kwargs:
+        Any field accepted by :class:`AgentServerSettings` can be passed here
+        (e.g. ``memory_type="redis"``, ``memory_redis_url="redis://..."``,
+        ``agent_port=9000``).
+
+    Examples
+    --------
+    Minimal — everything from env vars:
+
+        server = Server(agent, tools=[add])
+        server.run()
+
+    With explicit name and port:
+
+        server = Server(agent, tools=[add], agent_name="math-agent", agent_port=9000)
+        server.run(reload=True)
+
+    Expose the FastAPI app for an external process manager:
+
+        server = Server(agent, tools=[add])
+        app = server.app            # uvicorn agent:app
+
+    With middleware:
+
+        from fast_langchain_server import AuthMiddleware, APIKeyProvider
+        from starlette.middleware.cors import CORSMiddleware
+
+        server = Server(agent, tools=[add])
+        server.add_middleware(AuthMiddleware(APIKeyProvider(["secret"])))
+        server.add_middleware(CORSMiddleware, allow_origins=["*"])
+        server.run()
     """
 
     def __init__(
         self,
         agent: Any,
-        settings: AgentServerSettings,
-        memory: Optional[Memory] = None,
         tools: Optional[list] = None,
-        task_manager: Optional[TaskManager] = None,
+        agent_name: Optional[str] = None,
+        agent_description: Optional[str] = None,
+        a2a: bool = True,
         lifespan: Optional[Lifespan] = None,
+        memory: Optional[Memory] = None,
+        **settings_kwargs: Any,
     ) -> None:
+        # ── Settings ──────────────────────────────────────────────────────────
+        if not settings_kwargs:
+            settings_kwargs = _extract_agent_settings(agent)
+
+        if agent_name:
+            settings_kwargs["agent_name"] = agent_name
+        if agent_description:
+            settings_kwargs["agent_description"] = agent_description
+
+        settings_kwargs["task_manager_type"] = "local" if a2a else "none"
+
+        settings = AgentServerSettings(**settings_kwargs)  # type: ignore[call-arg]
+
+        # ── Logging & OTel ────────────────────────────────────────────────────
+        configure_logging(settings.agent_log_level, otel_correlation=settings.otel_active)
+        if settings.otel_active:
+            init_otel(settings.agent_name)
+
+        # ── Internal state ────────────────────────────────────────────────────
         self._agent = agent
         self._settings = settings
-        self._memory: Memory = memory or NullMemory()
         self._tools: list = tools or []
-        self._task_manager: TaskManager = task_manager or NullTaskManager()
         self._middlewares: list[AgentMiddleware] = []
         self.lifespan_context: dict = {}
         self._lifespan_obj: Lifespan = lifespan or DEFAULT_LIFESPAN
 
+        # ── Memory ────────────────────────────────────────────────────────────
+        self._memory: Memory = memory or create_memory(
+            memory_type=settings.memory_type if settings.memory_enabled else "null",
+            redis_url=settings.memory_redis_url,
+            max_sessions=settings.memory_max_sessions,
+            max_messages_per_session=settings.memory_max_messages_per_session,
+        )
+
+        # ── FastAPI app ───────────────────────────────────────────────────────
         self._app = FastAPI(
             title=settings.agent_name,
             description=settings.agent_description,
             lifespan=self._lifespan,
         )
         self._setup_routes()
+
+        # ── A2A task manager ──────────────────────────────────────────────────
+        self._task_manager: TaskManager = NullTaskManager()
+        if a2a:
+            tm = LocalTaskManager(
+                process_fn=self._process_fn,
+                max_tasks=settings.task_manager_max_tasks,
+            )
+            self._task_manager = tm
+            setup_a2a_routes(self._app, tm)
+            logger.info("A2A LocalTaskManager wired (max_tasks=%d)", settings.task_manager_max_tasks)
+
+        logger.info(
+            "Server '%s' ready  a2a=%s  memory=%s",
+            settings.agent_name,
+            a2a,
+            settings.memory_type if settings.memory_enabled else "disabled",
+        )
 
     # ── Lifespan ──────────────────────────────────────────────────────────────
 
@@ -158,16 +270,89 @@ class AgentServer:
 
     # ── Middleware registration ───────────────────────────────────────────────
 
-    def add_middleware(self, middleware: AgentMiddleware) -> "AgentServer":
-        """Append a middleware to the chain.
+    def add_middleware(self, middleware: Any, **kwargs: Any) -> "Server":
+        """Add a middleware to the server.
 
-        Middlewares execute in the order they are added (first added = outermost
-        wrapper).  Returns ``self`` to allow chaining::
+        Routing is determined by the middleware type:
 
-            server.add_middleware(TimingMiddleware()).add_middleware(RateLimitMiddleware())
+        - :class:`AgentMiddleware` instances are added to the internal
+          request-processing chain (auth, rate-limit, timing, etc.).
+        - Any other value is treated as a Starlette/ASGI middleware **class**
+          and forwarded to ``app.add_middleware()`` (CORS, GZip, TrustedHost…)::
+
+              server.add_middleware(CORSMiddleware, allow_origins=["*"])
+
+        Returns ``self`` to allow chaining::
+
+            (
+                server
+                .add_middleware(TimingMiddleware())
+                .add_middleware(AuthMiddleware(provider))
+                .add_middleware(CORSMiddleware, allow_origins=["*"])
+            )
         """
-        self._middlewares.append(middleware)
+        if isinstance(middleware, AgentMiddleware):
+            self._middlewares.append(middleware)
+        else:
+            self._app.add_middleware(middleware, **kwargs)
         return self
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    @property
+    def app(self) -> FastAPI:
+        """The underlying FastAPI application.
+
+        Use this to expose the server to an external process manager::
+
+            server = Server(agent, tools=[add])
+            app = server.app   # uvicorn agent:app
+        """
+        return self._app
+
+    def run(
+        self,
+        host: str = "0.0.0.0",  # nosec B104 - intentional for containerized deployment
+        port: Optional[int] = None,
+        reload: bool = False,
+        workers: Optional[int] = None,
+        log_level: Optional[str] = None,
+        access_log: Optional[bool] = None,
+        **uvicorn_kwargs: Any,
+    ) -> None:
+        """Start the server with uvicorn.
+
+        Parameters
+        ----------
+        host:
+            Bind host (default ``"0.0.0.0"``).
+        port:
+            Bind port.  Falls back to ``AGENT_PORT`` env var / settings (default 8000).
+        reload:
+            Enable auto-reload on file changes (development only).
+        workers:
+            Number of worker processes.  Cannot be combined with ``reload``.
+        log_level:
+            Uvicorn log level (``"debug"``, ``"info"``, ``"warning"``, …).
+            Falls back to ``AGENT_LOG_LEVEL`` / settings.
+        access_log:
+            Enable HTTP access logging.  Falls back to ``AGENT_ACCESS_LOG`` / settings.
+        **uvicorn_kwargs:
+            Any additional keyword argument accepted by :func:`uvicorn.run`
+            (e.g. ``ssl_keyfile``, ``ssl_certfile``, ``timeout_keep_alive``).
+        """
+        import uvicorn
+
+        uvicorn.run(
+            self._app,
+            host=host,
+            port=port if port is not None else self._settings.agent_port,
+            reload=reload,
+            workers=workers,
+            log_level=(log_level or self._settings.agent_log_level).lower(),
+            access_log=access_log if access_log is not None else self._settings.agent_access_log,
+            **uvicorn_kwargs,
+        )
 
     # ── Route setup ───────────────────────────────────────────────────────────
 
@@ -225,10 +410,6 @@ class AgentServer:
             ctx.set_meta("method", "POST")
 
             if req.stream:
-                # For streaming we only run the middleware chain for the
-                # on_request hook (auth, rate-limit, etc.) before handing off
-                # the generator.  The generator itself is not wrapped because
-                # it yields bytes incrementally.
                 async def _stream_handler(c: AgentContext) -> StreamingResponse:
                     return StreamingResponse(
                         self._stream_response(c),
@@ -264,11 +445,6 @@ class AgentServer:
             if not deleted:
                 raise HTTPException(status_code=404, detail="Session not found")
             return {"deleted": session_id}
-
-        # ── A2A JSON-RPC (only when task manager is active) ───────────────────
-        if not isinstance(self._task_manager, NullTaskManager):
-            setup_a2a_routes(app, self._task_manager)
-            logger.info("A2A JSON-RPC endpoint mounted at POST /")
 
     # ── Non-streaming execution ───────────────────────────────────────────────
 
@@ -307,7 +483,6 @@ class AgentServer:
             final = all_messages[-1]
             response_text = extract_text_content(final.content)
 
-            # Count tool calls in the new messages (everything after input)
             new_msgs = all_messages[len(input_messages):]
             tool_call_count = sum(
                 len(getattr(m, "tool_calls", None) or []) for m in new_msgs
@@ -317,9 +492,7 @@ class AgentServer:
 
     # ── Streaming execution ───────────────────────────────────────────────────
 
-    async def _stream_response(
-        self, ctx: AgentContext
-    ) -> AsyncGenerator[str, None]:
+    async def _stream_response(self, ctx: AgentContext) -> AsyncGenerator[str, None]:
         """
         Async generator that yields SSE-formatted strings.
 
@@ -337,8 +510,6 @@ class AgentServer:
         """
         tracer = trace_api.get_tracer(SERVICE_NAME)
 
-        # Wire ctx._emit so that deep call sites can push progress events via
-        # ctx.emit_progress() without knowing about the SSE transport.
         pending_events: list[dict] = []
 
         async def _emit(event: dict) -> None:
@@ -346,8 +517,6 @@ class AgentServer:
 
         ctx._emit = _emit
 
-        # The span must stay open across the whole generator, so we use a
-        # context-manager approach without 'with' (enter/exit manually).
         span = tracer.start_span(
             "fls.server.stream",
             context=ctx.otel_context,
@@ -372,7 +541,6 @@ class AgentServer:
                 {"messages": input_messages},
                 stream_mode=["messages", "updates"],
             ):
-                # Flush any progress events queued by ctx.emit_progress()
                 for event in pending_events:
                     yield f"data: {json.dumps(event)}\n\n"
                 pending_events.clear()
@@ -381,19 +549,16 @@ class AgentServer:
                     chunk, _metadata = data
 
                     if isinstance(chunk, AIMessageChunk):
-                        # Detect and announce new tool calls
                         for tc in chunk.tool_call_chunks or []:
                             tool_name = tc.get("name", "")
                             if tool_name and tool_name not in announced_tools:
                                 announced_tools.add(tool_name)
                                 total_tool_calls += 1
                                 await ctx.emit_progress("tool_call", tool_name)
-                                # Flush immediately so the client sees it now
                                 for event in pending_events:
                                     yield f"data: {json.dumps(event)}\n\n"
                                 pending_events.clear()
 
-                        # Stream LLM tokens
                         if chunk.content:
                             sse = {
                                 "id": response_id,
@@ -435,11 +600,7 @@ class AgentServer:
     # ── process_fn for A2A task manager ──────────────────────────────────────
 
     async def _process_fn(self, text: str, session_id: str) -> Tuple[str, int]:
-        """Bridge between the A2A task manager and the agent.
-
-        The task manager calls this function with each iteration message and
-        expects ``(response_text, tool_call_count)``.
-        """
+        """Bridge between the A2A task manager and the agent."""
         ctx = AgentContext.from_request(
             session_id=session_id,
             user_input=text,
@@ -503,205 +664,10 @@ class AgentServer:
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
 
-    # ── Public API ────────────────────────────────────────────────────────────
-
-    @property
-    def app(self) -> FastAPI:
-        return self._app
-
-    def run(self, host: str = "0.0.0.0") -> None:  # nosec B104 - intentional for containerized deployment
-        import uvicorn
-        uvicorn.run(
-            self._app,
-            host=host,
-            port=self._settings.agent_port,
-            log_level=self._settings.agent_log_level.lower(),
-            access_log=self._settings.agent_access_log,
-        )
-
 
 # ---------------------------------------------------------------------------
-# Factory
+# Private helpers — model config extraction
 # ---------------------------------------------------------------------------
-
-
-def create_agent_server(
-    settings: Optional[AgentServerSettings] = None,
-    tools: Optional[list] = None,
-    custom_agent: Any = None,
-    system_prompt: Optional[str] = None,
-    lifespan: Optional[Lifespan] = None,
-) -> AgentServer:
-    """Build a fully wired AgentServer from environment variables.
-
-    Parameters
-    ----------
-    settings:
-        Pre-built settings.  Loaded from env vars / .env when ``None``.
-    tools:
-        LangChain tools to attach.  Ignored when ``custom_agent`` is provided.
-    custom_agent:
-        An already-compiled LangGraph/LangChain agent (``CompiledStateGraph``).
-        When provided, model and agent creation are skipped.
-    system_prompt:
-        Override the system prompt from settings.  Ignored when
-        ``custom_agent`` is provided.
-    lifespan:
-        Custom composable ``Lifespan`` (or ``ComposedLifespan``) to use instead
-        of the built-in ``DEFAULT_LIFESPAN``.  Compose additional lifespans with
-        ``|``::
-
-            from fast_langchain_server.lifespan import lifespan, DEFAULT_LIFESPAN
-
-            @lifespan
-            async def my_db(server):
-                server.lifespan_context["db"] = await connect()
-                yield {}
-                await server.lifespan_context["db"].close()
-
-            server = create_agent_server(lifespan=DEFAULT_LIFESPAN | my_db)
-
-    Examples
-    --------
-    # Everything from env vars
-    server = create_agent_server(tools=[my_tool])
-    server.run()
-
-    # With a pre-built agent
-    from langchain.agents import create_agent
-    agent = create_agent("openai:gpt-4o", tools=[my_tool])
-    server = create_agent_server(custom_agent=agent, tools=[my_tool])
-    server.run()
-    """
-    if settings is None:
-        settings = AgentServerSettings()  # type: ignore[call-arg]
-
-    configure_logging(settings.agent_log_level, otel_correlation=settings.otel_active)
-
-    # ── OTel (early init so factory logging is traced) ────────────────────────
-    if settings.otel_active:
-        init_otel(settings.agent_name)
-
-    # ── Memory backend ────────────────────────────────────────────────────────
-    memory = create_memory(
-        memory_type=settings.memory_type if settings.memory_enabled else "null",
-        redis_url=settings.memory_redis_url,
-        max_sessions=settings.memory_max_sessions,
-        max_messages_per_session=settings.memory_max_messages_per_session,
-    )
-
-    # ── Agent ─────────────────────────────────────────────────────────────────
-    if custom_agent is not None:
-        agent = custom_agent
-        logger.info("Using provided agent: %s", type(agent).__name__)
-    else:
-        from langchain.agents import create_agent as lc_create_agent
-
-        model = build_langchain_model(settings)
-        prompt = system_prompt or settings.agent_instructions
-
-        logger.info(
-            "Creating agent '%s' with %d tool(s)", settings.agent_name, len(tools or [])
-        )
-        agent = lc_create_agent(
-            model=model,
-            tools=tools or [],
-            system_prompt=prompt,
-        )
-
-    # ── A2A task manager ──────────────────────────────────────────────────────
-    # We need a forward reference to the server's _process_fn, so we build a
-    # placeholder and wire it after the server is created.
-    server = AgentServer(
-        agent=agent,
-        settings=settings,
-        memory=memory,
-        tools=tools or [],
-        task_manager=NullTaskManager(),  # replaced below if needed
-        lifespan=lifespan,
-    )
-
-    if settings.task_manager_type == "local":
-        tm = LocalTaskManager(
-            process_fn=server._process_fn,
-            max_tasks=settings.task_manager_max_tasks,
-        )
-        server._task_manager = tm
-        setup_a2a_routes(server.app, tm)
-        logger.info("A2A LocalTaskManager wired (max_tasks=%d)", settings.task_manager_max_tasks)
-
-    return server
-
-
-# ---------------------------------------------------------------------------
-# ASGI factory entry point
-# ---------------------------------------------------------------------------
-
-
-def get_app() -> FastAPI:
-    """ASGI factory used by: uvicorn fast_langchain_server.server:get_app --factory"""
-    return create_agent_server().app
-
-
-def serve(
-    agent: Any,
-    tools: Optional[list] = None,
-    agent_name: Optional[str] = None,
-    agent_description: Optional[str] = None,
-    a2a: bool = True,
-    **kwargs: Any
-) -> FastAPI:
-    """One-liner to wrap an existing agent as a FastAPI ASGI app.
-
-    Parameters
-    ----------
-    agent : CompiledStateGraph
-        A LangChain/LangGraph agent (from create_agent()).
-    tools : list, optional
-        List of tools to expose in the agent discovery card.
-    agent_name : str, optional
-        Name for the agent. Falls back to AGENT_NAME env var or auto-generated.
-    agent_description : str, optional
-        Description for the agent. Falls back to AGENT_DESCRIPTION env var.
-    a2a : bool, default=True
-        Enable A2A (Agent-to-Agent) JSON-RPC 2.0 protocol support.
-        Set to False to disable A2A and reduce resource usage.
-    **kwargs
-        Additional settings passed to AgentServerSettings.
-
-    Example
-    -------
-    from langchain.agents import create_agent
-    from fast_langchain_server import serve
-
-    agent = create_agent(model=model, tools=[my_tool])
-    app = serve(
-        agent,
-        tools=[my_tool],
-        agent_name="my-agent",
-        agent_description="My custom agent",
-        a2a=True  # Enabled by default
-    )
-
-    # Disable A2A if not needed:
-    app = serve(agent, tools=[my_tool], a2a=False)
-    """
-    # Extract model info from agent if not provided in kwargs
-    if not kwargs:
-        kwargs = _extract_agent_settings(agent)
-
-    # Allow overriding agent name and description via parameters
-    if agent_name:
-        kwargs["agent_name"] = agent_name
-    if agent_description:
-        kwargs["agent_description"] = agent_description
-
-    # Set task manager type based on a2a parameter
-    kwargs["task_manager_type"] = "local" if a2a else "none"
-
-    settings = AgentServerSettings(**kwargs)  # type: ignore[call-arg]
-    server = create_agent_server(settings=settings, custom_agent=agent, tools=tools or [])
-    return server.app
 
 
 def _extract_agent_settings(agent: Any) -> dict[str, Any]:
@@ -712,46 +678,36 @@ def _extract_agent_settings(agent: Any) -> dict[str, Any]:
     """
     import os
 
-    settings = {}
+    settings: dict[str, Any] = {}
 
     try:
-        # Try to find the model in the agent's graph nodes
         if hasattr(agent, "nodes"):
-            for node_name, node_data in agent.nodes.items():
+            for _node_name, node_data in agent.nodes.items():
                 if hasattr(node_data, "runnable"):
-                    runnable = node_data.runnable
-                    # Look for ChatOpenAI in the runnable
-                    if _extract_model_from_runnable(runnable, settings):
+                    if _extract_model_from_runnable(node_data.runnable, settings):
                         break
 
-        # Fallback: check if agent has a direct reference to the model
         if not settings and hasattr(agent, "runnable"):
             _extract_model_from_runnable(agent.runnable, settings)
-    except Exception as e:
-        logger.warning(f"Could not auto-extract model settings: {e}")
+    except Exception as exc:
+        logger.warning("Could not auto-extract model settings: %s", exc)
 
-    # Try to get model info from environment variables if not found in agent
     if "model_name" not in settings:
         settings["model_name"] = os.getenv("MODEL_NAME") or os.getenv("OPENAI_MODEL")
     if "model_api_url" not in settings:
         settings["model_api_url"] = os.getenv("MODEL_API_URL") or os.getenv("OPENAI_BASE_URL")
 
-    # Generate a default agent name if not found
     if "agent_name" not in settings:
-        agent_name = os.getenv("AGENT_NAME")
-        if not agent_name:
-            agent_name = f"agent-{uuid.uuid4().hex[:8]}"
-        settings["agent_name"] = agent_name
+        settings["agent_name"] = os.getenv("AGENT_NAME") or f"agent-{uuid.uuid4().hex[:8]}"
 
     return settings
 
 
 def _extract_model_from_runnable(runnable: Any, settings: dict[str, Any]) -> bool:
-    """Recursively search a runnable for ChatOpenAI model and extract settings."""
+    """Recursively search a runnable for a ChatOpenAI model and extract settings."""
     if runnable is None:
         return False
 
-    # Check if this is a ChatOpenAI instance
     if type(runnable).__name__ == "ChatOpenAI":
         if hasattr(runnable, "model_name"):
             settings["model_name"] = runnable.model_name
@@ -759,23 +715,17 @@ def _extract_model_from_runnable(runnable: Any, settings: dict[str, Any]) -> boo
             settings["model_api_url"] = runnable.base_url
         return bool(settings.get("model_name") and settings.get("model_api_url"))
 
-    # Check nested runnables
-    if hasattr(runnable, "first"):
-        if _extract_model_from_runnable(runnable.first, settings):
-            return True
-    if hasattr(runnable, "middle"):
-        if isinstance(runnable.middle, list):
-            for item in runnable.middle:
-                if _extract_model_from_runnable(item, settings):
-                    return True
-        else:
-            if _extract_model_from_runnable(runnable.middle, settings):
+    for attr in ("first", "last"):
+        if hasattr(runnable, attr):
+            if _extract_model_from_runnable(getattr(runnable, attr), settings):
                 return True
-    if hasattr(runnable, "last"):
-        if _extract_model_from_runnable(runnable.last, settings):
-            return True
 
-    # Check steps in a sequence
+    if hasattr(runnable, "middle"):
+        items = runnable.middle if isinstance(runnable.middle, list) else [runnable.middle]
+        for item in items:
+            if _extract_model_from_runnable(item, settings):
+                return True
+
     if hasattr(runnable, "steps"):
         for step in runnable.steps:
             if _extract_model_from_runnable(step, settings):

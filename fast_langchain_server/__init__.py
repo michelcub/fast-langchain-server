@@ -5,24 +5,24 @@ Production HTTP server for LangChain / LangGraph agents.
 
 Quick start
 -----------
-# agent.py
-from langchain.agents import create_agent
-from langchain_core.tools import tool
-from fast_langchain_server import serve
+    # agent.py
+    from langchain.agents import create_agent
+    from langchain_core.tools import tool
+    from fast_langchain_server import Server
 
-@tool
-def add(a: int, b: int) -> int:
-    "Add two numbers."
-    return a + b
+    @tool
+    def add(a: int, b: int) -> int:
+        "Add two numbers."
+        return a + b
 
-agent = create_agent("openai:gpt-4o", tools=[add])
-app = serve(agent, tools=[add])   # FastAPI ASGI app
+    agent = create_agent("openai:gpt-4o", tools=[add])
+    server = Server(agent, tools=[add])
 
-# Run: uvicorn agent:app --reload
-# Or:  AGENT_NAME=my-agent MODEL_API_URL=... MODEL_NAME=... fast-langchain-server run agent.py
+    # Run directly:   python agent.py  (call server.run())
+    # Or with uvicorn: uvicorn agent:server.app
 """
 
-from fast_langchain_server.server import create_agent_server, serve
+from fast_langchain_server.server import Server
 from fast_langchain_server.context import AgentContext
 from fast_langchain_server.auth import (
     AuthToken,
@@ -57,8 +57,7 @@ from fast_langchain_server.authorization import (
 
 __all__ = [
     # Server
-    "serve",
-    "create_agent_server",
+    "Server",
     # Context
     "AgentContext",
     # Auth
@@ -88,4 +87,4 @@ __all__ = [
     "all_of",
     "any_of",
 ]
-__version__ = "0.2.0"
+__version__ = "0.5.0"

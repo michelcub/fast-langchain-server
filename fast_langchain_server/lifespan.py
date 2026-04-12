@@ -28,9 +28,9 @@ Compose multiple lifespans::
 
     combined = db_lifespan | cache_lifespan
 
-Pass to ``create_agent_server``::
+Pass to ``Server``::
 
-    server = create_agent_server(tools=[...], lifespan=combined)
+    server = Server(agent, tools=[...], lifespan=combined)
 
 Access at runtime::
 
@@ -38,7 +38,7 @@ Access at runtime::
 
 Built-in lifespans
 ------------------
-The ``AgentServer`` ships four built-in lifespans that replace the previous
+The ``Server`` ships four built-in lifespans that replace the previous
 monolithic ``_lifespan`` method:
 
   _otel_lifespan        — initialises OpenTelemetry
@@ -56,12 +56,12 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable
 
 if TYPE_CHECKING:
-    from fast_langchain_server.server import AgentServer
+    from fast_langchain_server.server import Server
 
 logger = logging.getLogger(__name__)
 
 # Type alias for the generator function a lifespan wraps
-_LifespanFn = Callable[["AgentServer"], AsyncGenerator[dict, None]]
+_LifespanFn = Callable[["Server"], AsyncGenerator[dict, None]]
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +85,7 @@ class Lifespan:
         return ComposedLifespan(self, other)
 
     @asynccontextmanager
-    async def _as_cm(self, server: "AgentServer"):
+    async def _as_cm(self, server: "Server"):
         """Run this lifespan as an async context manager, yielding its dict."""
         gen = self._fn(server)
         try:
@@ -101,7 +101,7 @@ class Lifespan:
                 pass
 
     async def __call__(
-        self, server: "AgentServer"
+        self, server: "Server"
     ) -> AsyncGenerator[dict, None]:
         """Allow using a Lifespan directly as a FastAPI lifespan function."""
         async with self._as_cm(server) as ctx:
@@ -126,12 +126,12 @@ class ComposedLifespan(Lifespan):
         self._fn = None  # type: ignore[assignment]
 
     @asynccontextmanager
-    async def _as_cm(self, server: "AgentServer"):
+    async def _as_cm(self, server: "Server"):
         async with self.left._as_cm(server) as lctx:
             async with self.right._as_cm(server) as rctx:
                 yield {**lctx, **rctx}
 
-    async def __call__(self, server: "AgentServer") -> AsyncGenerator[dict, None]:
+    async def __call__(self, server: "Server") -> AsyncGenerator[dict, None]:
         async with self._as_cm(server) as ctx:
             yield ctx
 
@@ -145,7 +145,7 @@ def lifespan(fn: _LifespanFn) -> Lifespan:
     """Decorator: turns an async generator into a composable ``Lifespan``.
 
     The decorated function must:
-    - Accept a single positional argument: the ``AgentServer`` instance.
+    - Accept a single positional argument: the ``Server`` instance.
     - ``yield`` exactly once, optionally yielding a ``dict`` that is merged
       into ``server.lifespan_context``.
     - Perform teardown after the ``yield`` (use ``try/finally`` for safety).
@@ -167,7 +167,7 @@ def lifespan(fn: _LifespanFn) -> Lifespan:
 
 
 @lifespan
-async def _otel_lifespan(server: "AgentServer") -> AsyncGenerator[dict, None]:
+async def _otel_lifespan(server: "Server") -> AsyncGenerator[dict, None]:
     """Initialise OpenTelemetry if enabled in settings."""
     from fast_langchain_server.telemetry import init_otel
 
@@ -177,7 +177,7 @@ async def _otel_lifespan(server: "AgentServer") -> AsyncGenerator[dict, None]:
 
 
 @lifespan
-async def _log_lifespan(server: "AgentServer") -> AsyncGenerator[dict, None]:
+async def _log_lifespan(server: "Server") -> AsyncGenerator[dict, None]:
     """Log startup and shutdown messages."""
     from fast_langchain_server.a2a import NullTaskManager
     from fast_langchain_server.telemetry import is_otel_enabled
@@ -196,7 +196,7 @@ async def _log_lifespan(server: "AgentServer") -> AsyncGenerator[dict, None]:
 
 
 @lifespan
-async def _autonomous_lifespan(server: "AgentServer") -> AsyncGenerator[dict, None]:
+async def _autonomous_lifespan(server: "Server") -> AsyncGenerator[dict, None]:
     """Launch the autonomous loop at startup when configured."""
     from fast_langchain_server.a2a import AutonomousConfig, NullTaskManager
 
@@ -226,7 +226,7 @@ async def _autonomous_lifespan(server: "AgentServer") -> AsyncGenerator[dict, No
 
 
 @lifespan
-async def _shutdown_lifespan(server: "AgentServer") -> AsyncGenerator[dict, None]:
+async def _shutdown_lifespan(server: "Server") -> AsyncGenerator[dict, None]:
     """Gracefully shut down the task manager and memory backend on exit."""
     yield {}
     await server._task_manager.shutdown()
@@ -234,7 +234,7 @@ async def _shutdown_lifespan(server: "AgentServer") -> AsyncGenerator[dict, None
 
 
 # ---------------------------------------------------------------------------
-# Default composed lifespan used by AgentServer
+# Default composed lifespan used by Server
 # ---------------------------------------------------------------------------
 
 DEFAULT_LIFESPAN: Lifespan = (

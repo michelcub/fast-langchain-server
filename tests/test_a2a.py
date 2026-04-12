@@ -5,7 +5,7 @@ Covers:
 - Task data model serialisation
 - LocalTaskManager lifecycle (submit, get, cancel)
 - JSON-RPC dispatcher (SendMessage, GetTask, CancelTask, unknown method)
-- A2A routes mounted on AgentServer when task_manager_type=local
+- A2A routes mounted on Server when a2a=True
 - Autonomous submit (background task, budget-based)
 - NullTaskManager no-ops
 """
@@ -30,8 +30,7 @@ from fast_langchain_server.a2a import (
     JSONRPC_TASK_NOT_FOUND,
 )
 from fast_langchain_server.memory import LocalMemory
-from fast_langchain_server.server import AgentServer
-from fast_langchain_server.serverutils import AgentServerSettings
+from fast_langchain_server.server import Server
 
 from .conftest import _make_mock_agent
 
@@ -226,27 +225,21 @@ class TestNullTaskManager:
 
 
 # ---------------------------------------------------------------------------
-# JSON-RPC endpoint via AgentServer
+# JSON-RPC endpoint via Server
 # ---------------------------------------------------------------------------
 
+_A2A_KWARGS = dict(
+    agent_name="a2a-test",
+    model_api_url="http://localhost:11434/v1",
+    model_name="test",
+    agent_port=8766,
+    a2a=True,
+)
 
-def _a2a_server(response: str = "a2a response") -> tuple[AgentServer, TestClient]:
-    """Build an AgentServer with a LocalTaskManager and return (server, client)."""
-    settings = AgentServerSettings(
-        agent_name="a2a-test",
-        model_api_url="http://localhost:11434/v1",
-        model_name="test",
-        agent_port=8766,
-        task_manager_type="local",
-    )
 
-    async def _pf(t: str, s: str):
-        return response, 0
-
-    agent = _make_mock_agent(response)
-    memory = LocalMemory()
-    tm = LocalTaskManager(process_fn=_pf)
-    server = AgentServer(agent=agent, settings=settings, memory=memory, task_manager=tm)
+def _a2a_server(response: str = "a2a response") -> tuple[Server, TestClient]:
+    """Build a Server with A2A enabled and return (server, client)."""
+    server = Server(agent=_make_mock_agent(response), memory=LocalMemory(), **_A2A_KWARGS)
     return server, TestClient(server.app)
 
 
@@ -268,78 +261,48 @@ class TestA2ARoutes:
         assert "jsonrpc" not in card["supportedProtocols"]
 
     def test_agent_card_shows_a2a_true_when_local(self):
-        settings = AgentServerSettings(
+        server = Server(
+            agent=_make_mock_agent(),
+            memory=LocalMemory(),
             agent_name="a2a-card-test",
             model_api_url="http://x",
             model_name="m",
-            task_manager_type="local",
+            a2a=True,
         )
-        agent = _make_mock_agent()
-        memory = LocalMemory()
-
-        async def pf(t, s): return "ok", 0
-        tm = LocalTaskManager(process_fn=pf)
-        server = AgentServer(agent=agent, settings=settings, memory=memory, task_manager=tm)
         c = TestClient(server.app)
         card = c.get("/.well-known/agent.json").json()
         assert card["capabilities"]["a2a"] is True
         assert "jsonrpc" in card["supportedProtocols"]
 
     def test_unknown_method_returns_method_not_found(self):
-        settings = AgentServerSettings(
-            agent_name="a2a-rpc-test", model_api_url="http://x", model_name="m", task_manager_type="local"
-        )
-        async def pf(t, s): return "ok", 0
-        tm = LocalTaskManager(process_fn=pf)
-        server = AgentServer(agent=_make_mock_agent(), settings=settings, memory=LocalMemory(), task_manager=tm)
+        server = Server(agent=_make_mock_agent(), memory=LocalMemory(), **_A2A_KWARGS)
         c = TestClient(server.app)
         body = _rpc(c, "UnknownMethod", {})
         assert body["error"]["code"] == JSONRPC_METHOD_NOT_FOUND
 
     def test_send_message_missing_message_returns_invalid_params(self):
-        settings = AgentServerSettings(
-            agent_name="a2a-rpc-test2", model_api_url="http://x", model_name="m", task_manager_type="local"
-        )
-        async def pf(t, s): return "ok", 0
-        tm = LocalTaskManager(process_fn=pf)
-        server = AgentServer(agent=_make_mock_agent(), settings=settings, memory=LocalMemory(), task_manager=tm)
+        server = Server(agent=_make_mock_agent(), memory=LocalMemory(), **_A2A_KWARGS)
         c = TestClient(server.app)
         body = _rpc(c, "SendMessage", {})
         assert body["error"]["code"] == JSONRPC_INVALID_PARAMS
 
     def test_get_task_missing_id_returns_invalid_params(self):
-        settings = AgentServerSettings(
-            agent_name="a2a-get-test", model_api_url="http://x", model_name="m", task_manager_type="local"
-        )
-        async def pf(t, s): return "ok", 0
-        tm = LocalTaskManager(process_fn=pf)
-        server = AgentServer(agent=_make_mock_agent(), settings=settings, memory=LocalMemory(), task_manager=tm)
+        server = Server(agent=_make_mock_agent(), memory=LocalMemory(), **_A2A_KWARGS)
         c = TestClient(server.app)
         body = _rpc(c, "GetTask", {})
         assert body["error"]["code"] == JSONRPC_INVALID_PARAMS
 
     def test_get_task_unknown_id_returns_task_not_found(self):
-        settings = AgentServerSettings(
-            agent_name="a2a-get-test2", model_api_url="http://x", model_name="m", task_manager_type="local"
-        )
-        async def pf(t, s): return "ok", 0
-        tm = LocalTaskManager(process_fn=pf)
-        server = AgentServer(agent=_make_mock_agent(), settings=settings, memory=LocalMemory(), task_manager=tm)
+        server = Server(agent=_make_mock_agent(), memory=LocalMemory(), **_A2A_KWARGS)
         c = TestClient(server.app)
         body = _rpc(c, "GetTask", {"id": "ghost_task"})
         assert body["error"]["code"] == JSONRPC_TASK_NOT_FOUND
 
     def test_send_message_and_get_task_full_flow(self):
         """SendMessage → GetTask round trip with A2A text message format."""
-        settings = AgentServerSettings(
-            agent_name="a2a-flow-test", model_api_url="http://x", model_name="m", task_manager_type="local"
-        )
-        async def pf(t, s): return f"reply to: {t}", 0
-        tm = LocalTaskManager(process_fn=pf)
-        server = AgentServer(agent=_make_mock_agent(), settings=settings, memory=LocalMemory(), task_manager=tm)
+        server = Server(agent=_make_mock_agent(), memory=LocalMemory(), **_A2A_KWARGS)
         c = TestClient(server.app)
 
-        # SendMessage with A2A message format
         send_resp = _rpc(c, "SendMessage", {
             "message": {
                 "role": "user",
@@ -352,19 +315,13 @@ class TestA2ARoutes:
         assert task["status"]["state"] == "completed"
         assert task["sessionId"] == "session-abc"
 
-        # GetTask
         get_resp = _rpc(c, "GetTask", {"id": task["id"]})
         assert "error" not in get_resp
         assert get_resp["result"]["id"] == task["id"]
 
     def test_cancel_task_full_flow(self):
         """CancelTask on a terminal task should return the task dict (not error)."""
-        settings = AgentServerSettings(
-            agent_name="a2a-cancel-test", model_api_url="http://x", model_name="m", task_manager_type="local"
-        )
-        async def pf(t, s): return "done", 0
-        tm = LocalTaskManager(process_fn=pf)
-        server = AgentServer(agent=_make_mock_agent(), settings=settings, memory=LocalMemory(), task_manager=tm)
+        server = Server(agent=_make_mock_agent(), memory=LocalMemory(), **_A2A_KWARGS)
         c = TestClient(server.app)
 
         send_resp = _rpc(c, "SendMessage", {
@@ -372,18 +329,12 @@ class TestA2ARoutes:
         })
         task_id = send_resp["result"]["id"]
 
-        # Task is already completed — cancel returns task dict without error
         cancel_resp = _rpc(c, "CancelTask", {"id": task_id})
         assert "error" not in cancel_resp
         assert cancel_resp["result"]["id"] == task_id
 
     def test_parse_error_on_invalid_json_body(self):
-        settings = AgentServerSettings(
-            agent_name="a2a-parse-test", model_api_url="http://x", model_name="m", task_manager_type="local"
-        )
-        async def pf(t, s): return "ok", 0
-        tm = LocalTaskManager(process_fn=pf)
-        server = AgentServer(agent=_make_mock_agent(), settings=settings, memory=LocalMemory(), task_manager=tm)
+        server = Server(agent=_make_mock_agent(), memory=LocalMemory(), **_A2A_KWARGS)
         c = TestClient(server.app)
         resp = c.post("/", content=b"not json", headers={"content-type": "application/json"})
         assert resp.status_code == 200
@@ -393,12 +344,7 @@ class TestA2ARoutes:
     @pytest.mark.asyncio
     async def test_send_message_legacy_tasks_send_alias(self):
         """tasks/send should work as alias for SendMessage."""
-        async def pf(t, s): return "ok", 0
-        tm = LocalTaskManager(process_fn=pf)
-        settings = AgentServerSettings(
-            agent_name="a2a-alias", model_api_url="http://x", model_name="m", task_manager_type="local"
-        )
-        server = AgentServer(agent=_make_mock_agent(), settings=settings, memory=LocalMemory(), task_manager=tm)
+        server = Server(agent=_make_mock_agent(), memory=LocalMemory(), **_A2A_KWARGS)
         c = TestClient(server.app)
         resp = _rpc(c, "tasks/send", {
             "message": {"role": "user", "parts": [{"type": "text", "text": "hello"}]}

@@ -1,5 +1,5 @@
 """
-Integration tests for AgentServer.
+Integration tests for Server.
 
 All tests use a mock CompiledStateGraph — no real LLM required.
 """
@@ -10,11 +10,10 @@ import json
 import pytest
 from httpx import AsyncClient, ASGITransport
 
-from fast_langchain_server.memory import LocalMemory, NullMemory
-from fast_langchain_server.server import AgentServer
-from fast_langchain_server.serverutils import AgentServerSettings
+from fast_langchain_server.memory import LocalMemory
+from fast_langchain_server.server import Server
 
-from .conftest import _make_mock_agent, _make_mock_agent_with_tool
+from .conftest import _make_mock_agent, _make_mock_agent_with_tool, _SERVER_KWARGS
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +44,7 @@ class TestHealthAndDiscovery:
         assert card["capabilities"]["streaming"] is True
         assert "skills" in card
 
-    def test_agent_card_includes_tools(self, settings, memory):
+    def test_agent_card_includes_tools(self, memory):
         from langchain_core.tools import tool
 
         @tool
@@ -53,9 +52,11 @@ class TestHealthAndDiscovery:
             "A simple calculator."
             return x * 2
 
-        agent = _make_mock_agent()
-        server = AgentServer(
-            agent=agent, settings=settings, memory=memory, tools=[my_calculator]
+        server = Server(
+            agent=_make_mock_agent(),
+            tools=[my_calculator],
+            memory=memory,
+            **_SERVER_KWARGS,
         )
         from fastapi.testclient import TestClient
         c = TestClient(server.app)
@@ -113,11 +114,14 @@ class TestChatCompletions:
         )
         assert resp.status_code == 400
 
-    def test_multi_turn_memory(self, settings):
+    def test_multi_turn_memory(self):
         """Session memory persists across multiple requests."""
         memory = LocalMemory()
-        agent = _make_mock_agent("Turn response")
-        server = AgentServer(agent=agent, settings=settings, memory=memory)
+        server = Server(
+            agent=_make_mock_agent("Turn response"),
+            memory=memory,
+            **_SERVER_KWARGS,
+        )
         from fastapi.testclient import TestClient
         c = TestClient(server.app)
 
@@ -130,7 +134,6 @@ class TestChatCompletions:
             )
             assert resp.status_code == 200
 
-        # Session should exist with accumulated messages
         sessions_resp = c.get("/memory/sessions")
         assert session in sessions_resp.json()["sessions"]
 
@@ -142,7 +145,7 @@ class TestChatCompletions:
 
 class TestStreaming:
     @pytest.mark.asyncio
-    async def test_streaming_returns_sse_events(self, server: AgentServer):
+    async def test_streaming_returns_sse_events(self, server: Server):
         async with AsyncClient(transport=ASGITransport(app=server.app), base_url="http://test") as ac:
             async with ac.stream(
                 "POST",
@@ -163,9 +166,8 @@ class TestStreaming:
                             if json_str:
                                 events.append(json.loads(json_str))
                         except json.JSONDecodeError:
-                            pass  # Skip malformed lines
+                            pass
 
-                # Should have at least one content chunk
                 content_events = [
                     e for e in events
                     if e.get("object") == "chat.completion.chunk"
@@ -179,9 +181,12 @@ class TestStreaming:
                 assert full_content == "Hello from mock agent!"
 
     @pytest.mark.asyncio
-    async def test_streaming_emits_progress_for_tool_calls(self, settings, memory):
-        agent = _make_mock_agent_with_tool()
-        server = AgentServer(agent=agent, settings=settings, memory=memory)
+    async def test_streaming_emits_progress_for_tool_calls(self, memory):
+        server = Server(
+            agent=_make_mock_agent_with_tool(),
+            memory=memory,
+            **_SERVER_KWARGS,
+        )
 
         async with AsyncClient(transport=ASGITransport(app=server.app), base_url="http://test") as ac:
             async with ac.stream(
@@ -202,7 +207,7 @@ class TestStreaming:
                             if json_str:
                                 events.append(json.loads(json_str))
                         except json.JSONDecodeError:
-                            pass  # Skip malformed lines
+                            pass
 
                 progress_events = [e for e in events if e.get("type") == "progress"]
                 assert len(progress_events) >= 1
