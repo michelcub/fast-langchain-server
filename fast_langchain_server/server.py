@@ -70,6 +70,7 @@ from fast_langchain_server.serverutils import (
     build_langchain_model,
     configure_logging,
     extract_text_content,
+    inspect_agent,
 )
 from fast_langchain_server.telemetry import (
     SERVICE_NAME,
@@ -451,6 +452,9 @@ class AgentServer:
     # ── Agent discovery card ──────────────────────────────────────────────────
 
     def _build_agent_card(self) -> dict:
+        # If no tools were explicitly registered, attempt introspection
+        tools = self._tools or inspect_agent(self._agent).get("tools", [])
+
         skills = [
             {
                 "id": getattr(t, "name", str(t)),
@@ -459,14 +463,22 @@ class AgentServer:
                 "inputModes": ["application/json"],
                 "outputModes": ["application/json"],
             }
-            for t in self._tools
+            for t in tools
         ]
+
+        # Use the explicit description from settings; fall back to the system
+        # prompt extracted from the agent when the setting is still the default.
+        description = self._settings.agent_description
+        if description == "AI Agent":
+            introspected = inspect_agent(self._agent).get("description", "")
+            if introspected:
+                description = introspected
 
         a2a_active = not isinstance(self._task_manager, NullTaskManager)
 
         return {
             "name": self._settings.agent_name,
-            "description": self._settings.agent_description,
+            "description": description,
             "url": f"http://localhost:{self._settings.agent_port}",
             "version": "0.1.0",
             "protocolVersion": "0.3.0",
@@ -616,7 +628,7 @@ def create_agent_server(
         agent=agent,
         settings=settings,
         memory=memory,
-        tools=tools or [],
+        tools=tools,          # None = auto-detect in _build_agent_card
         task_manager=NullTaskManager(),  # replaced below if needed
         lifespan=lifespan,
     )
@@ -646,14 +658,24 @@ def get_app() -> FastAPI:
 def serve(agent: Any, tools: Optional[list] = None, **kwargs: Any) -> FastAPI:
     """One-liner to wrap an existing agent as a FastAPI ASGI app.
 
+    ``tools`` is optional — when omitted the server will introspect the agent's
+    compiled graph to populate the A2A discovery card automatically.  Pass it
+    explicitly only when you want to override or restrict what appears in the
+    card.
+
     Example
     -------
     from langchain.agents import create_agent
     from fast_langchain_server import serve
 
     agent = create_agent("openai:gpt-4o", tools=[my_tool])
+
+    # tools auto-detected from the compiled graph:
+    app = serve(agent)
+
+    # or override explicitly:
     app = serve(agent, tools=[my_tool])
     """
     settings = AgentServerSettings(**kwargs) if kwargs else AgentServerSettings()  # type: ignore[call-arg]
-    server = create_agent_server(settings=settings, custom_agent=agent, tools=tools or [])
+    server = create_agent_server(settings=settings, custom_agent=agent, tools=tools)
     return server.app

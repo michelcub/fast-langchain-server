@@ -141,6 +141,73 @@ def build_langchain_model(settings: AgentServerSettings) -> Any:
     return ChatOpenAI(**kwargs)
 
 
+def inspect_agent(agent: Any) -> dict[str, Any]:
+    """Introspect a CompiledStateGraph and extract metadata without executing it.
+
+    Works for agents created with ``create_react_agent`` / ``create_agent``
+    (LangGraph prebuilt pattern).  Returns an empty/partial dict gracefully
+    for custom graphs that don't follow the standard structure.
+
+    Returns
+    -------
+    dict with keys:
+        tools       : list of LangChain BaseTool objects (may be empty)
+        description : system prompt string extracted from the agent (may be "")
+        model_name  : LLM model name string (may be "")
+    """
+    import inspect as _inspect
+
+    result: dict[str, Any] = {"tools": [], "description": "", "model_name": ""}
+
+    try:
+        nodes = getattr(agent, "nodes", {})
+
+        # ── Tools ─────────────────────────────────────────────────────────────
+        # The 'tools' node is a PregelNode whose .bound is a ToolNode.
+        # ToolNode.tools_by_name is a dict[str, BaseTool].
+        tools_pregel = nodes.get("tools")
+        if tools_pregel is not None:
+            tool_node = getattr(tools_pregel, "bound", None)
+            if tool_node is not None:
+                tools_by_name = getattr(tool_node, "tools_by_name", {})
+                result["tools"] = list(tools_by_name.values())
+    except Exception:
+        pass
+
+    try:
+        nodes = getattr(agent, "nodes", {})
+
+        # ── System prompt & model name ─────────────────────────────────────────
+        # The 'agent' node is a RunnableCallable whose .func closure contains
+        # 'static_model' — a RunnableSequence with:
+        #   steps[0]: RunnableCallable (prompt) — closure has '_system_message'
+        #   steps[1]: RunnableBinding wrapping the ChatModel
+        agent_pregel = nodes.get("agent")
+        if agent_pregel is not None:
+            runnable = getattr(agent_pregel, "bound", None)
+            if runnable is not None:
+                closure = _inspect.getclosurevars(runnable.func)
+                static_model = closure.nonlocals.get("static_model")
+                if static_model is not None and hasattr(static_model, "steps"):
+                    steps = static_model.steps
+                    # System prompt
+                    if steps:
+                        prompt_step = steps[0]
+                        prompt_closure = _inspect.getclosurevars(prompt_step.func)
+                        sys_msg = prompt_closure.nonlocals.get("_system_message")
+                        if sys_msg is not None:
+                            result["description"] = getattr(sys_msg, "content", "") or ""
+                    # Model name
+                    if len(steps) > 1:
+                        model_binding = steps[1]
+                        bound_model = getattr(model_binding, "bound", None)
+                        result["model_name"] = getattr(bound_model, "model_name", "") or ""
+    except Exception:
+        pass
+
+    return result
+
+
 def extract_text_content(content: Any) -> str:
     """Safely extract plain text from a LangChain message content field.
 

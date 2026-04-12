@@ -24,6 +24,7 @@ app = serve(agent, tools=[add])   # FastAPI ASGI app
 
 from fast_langchain_server.server import create_agent_server, serve
 from fast_langchain_server.context import AgentContext
+from fast_langchain_server.serverutils import inspect_agent
 from fast_langchain_server.auth import (
     AuthToken,
     AuthProvider,
@@ -59,6 +60,8 @@ __all__ = [
     # Server
     "serve",
     "create_agent_server",
+    # Introspection
+    "inspect_agent",
     # Context
     "AgentContext",
     # Auth
