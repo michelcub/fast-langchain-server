@@ -6,7 +6,7 @@ Uses a mock CompiledStateGraph so tests run without a real LLM endpoint.
 from __future__ import annotations
 
 from typing import Any, AsyncGenerator
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -14,8 +14,7 @@ from httpx import AsyncClient
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from fast_langchain_server.memory import LocalMemory, NullMemory
-from fast_langchain_server.server import AgentServer
-from fast_langchain_server.serverutils import AgentServerSettings
+from fast_langchain_server.server import Server
 
 
 # ---------------------------------------------------------------------------
@@ -27,7 +26,6 @@ def _make_mock_agent(response: str = "Hello from mock agent!") -> MagicMock:
     """Return a mock that behaves like a compiled LangGraph agent."""
     agent = MagicMock()
 
-    # ainvoke returns {"messages": [input..., AIMessage(response)]}
     async def mock_ainvoke(input_dict: dict, **kwargs) -> dict:
         msgs = list(input_dict.get("messages", []))
         msgs.append(AIMessage(content=response))
@@ -35,15 +33,11 @@ def _make_mock_agent(response: str = "Hello from mock agent!") -> MagicMock:
 
     agent.ainvoke = mock_ainvoke
 
-    # astream yields ("messages", chunk) and ("updates", delta) events
     async def mock_astream(input_dict: dict, stream_mode=None, **kwargs):
-        msgs = list(input_dict.get("messages", []))
-        ai_msg = AIMessage(content=response)
-        # Simulate token-by-token streaming
         from langchain_core.messages import AIMessageChunk
+        ai_msg = AIMessage(content=response)
         for char in response:
             yield ("messages", (AIMessageChunk(content=char), {"langgraph_node": "agent"}))
-        # Emit update with full message
         yield ("updates", {"agent": {"messages": [ai_msg]}})
 
     agent.astream = mock_astream
@@ -79,7 +73,6 @@ def _make_mock_agent_with_tool(
         from langchain_core.messages import AIMessageChunk
         tool_call_id = "call_abc123"
 
-        # Chunk with tool_call_chunk
         yield (
             "messages",
             (
@@ -92,11 +85,9 @@ def _make_mock_agent_with_tool(
                 {"langgraph_node": "agent"},
             ),
         )
-        # Tool result update
         tool_msg = ToolMessage(content=tool_response, tool_call_id=tool_call_id)
         yield ("updates", {"tools": {"messages": [tool_msg]}})
 
-        # Final response tokens
         for char in final_response:
             yield (
                 "messages",
@@ -112,25 +103,17 @@ def _make_mock_agent_with_tool(
 
 
 # ---------------------------------------------------------------------------
-# Settings fixture
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def settings() -> AgentServerSettings:
-    return AgentServerSettings(
-        agent_name="test-agent",
-        model_api_url="http://localhost:11434/v1",
-        model_name="test-model",
-        agent_port=8765,
-        memory_enabled=True,
-        memory_type="local",
-    )
-
-
-# ---------------------------------------------------------------------------
 # Server fixtures
 # ---------------------------------------------------------------------------
+
+_SERVER_KWARGS = dict(
+    agent_name="test-agent",
+    model_api_url="http://localhost:11434/v1",
+    model_name="test-model",
+    agent_port=8765,
+    memory_enabled=False,  # memory injected explicitly via the memory fixture
+    a2a=False,
+)
 
 
 @pytest.fixture
@@ -149,16 +132,16 @@ def memory():
 
 
 @pytest.fixture
-def server(mock_agent, settings, memory) -> AgentServer:
-    return AgentServer(agent=mock_agent, settings=settings, memory=memory)
+def server(mock_agent, memory) -> Server:
+    return Server(agent=mock_agent, memory=memory, **_SERVER_KWARGS)
 
 
 @pytest.fixture
-def client(server: AgentServer) -> TestClient:
+def client(server: Server) -> TestClient:
     return TestClient(server.app)
 
 
 @pytest.fixture
-async def async_client(server: AgentServer) -> AsyncGenerator[AsyncClient, None]:
+async def async_client(server: Server) -> AsyncGenerator[AsyncClient, None]:
     async with AsyncClient(app=server.app, base_url="http://test") as ac:
         yield ac

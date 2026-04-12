@@ -7,11 +7,14 @@ Pattern B: custom LangGraph StateGraph (any CompiledStateGraph works)
 Run with:
     AGENT_NAME=example MODEL_API_URL=http://localhost:11434/v1 MODEL_NAME=llama3.2 \
         fast-langchain-server run example_agent.py
+
+Or directly:
+    python example_agent.py
 """
 from langchain.agents import create_agent
 from langchain_core.tools import tool
 
-from fast_langchain_server import serve
+from fast_langchain_server import Server
 
 # ── Tools ─────────────────────────────────────────────────────────────────────
 
@@ -33,7 +36,6 @@ TOOLS = [add, greet]
 # ── Agent (Pattern A — langchain.agents.create_agent) ─────────────────────────
 # create_agent is the new LangChain 1.x API.
 # Under the hood it compiles a LangGraph CompiledStateGraph.
-# It is fully compatible with any model that supports tool calling.
 
 agent = create_agent(
     model="openai:gpt-4o",      # or: ChatOpenAI(base_url=..., model=...)
@@ -41,12 +43,21 @@ agent = create_agent(
     system_prompt="You are a helpful assistant. Use tools when appropriate.",
 )
 
-# ── ASGI app (for uvicorn / gunicorn) ─────────────────────────────────────────
-# serve() wraps the agent as a FastAPI app.
+# ── Server ────────────────────────────────────────────────────────────────────
+# Server is the single entry point.
 # Session memory, streaming, health probes and the discovery card are all
 # wired automatically.
 
-app = serve(agent, tools=TOOLS)
+server = Server(agent, tools=TOOLS)
+
+# Expose the FastAPI app for uvicorn / gunicorn:
+#   uvicorn example_agent:server.app
+app = server.app
+
+# Or run directly (blocks):
+#   python example_agent.py
+if __name__ == "__main__":
+    server.run()
 
 
 # ── Pattern B — custom LangGraph graph ────────────────────────────────────────
@@ -54,4 +65,4 @@ app = serve(agent, tools=TOOLS)
 #
 # from langgraph.prebuilt import create_react_agent
 # react_agent = create_react_agent(model, tools=TOOLS)
-# app = serve(react_agent, tools=TOOLS)
+# server = Server(react_agent, tools=TOOLS)
