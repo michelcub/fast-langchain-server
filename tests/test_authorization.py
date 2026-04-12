@@ -51,7 +51,6 @@ def _agent_ctx(
     ctx = AgentContext.from_request(
         session_id=session_id,
         user_input="hello",
-        headers={},
     )
     ctx.set_meta("endpoint", endpoint)
     ctx.set_meta("method", "POST")

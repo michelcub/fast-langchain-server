@@ -6,6 +6,7 @@ import time
 
 import pytest
 from fastapi import HTTPException
+from starlette.requests import Request
 
 from fast_langchain_server.auth import APIKeyProvider, AuthToken
 from fast_langchain_server.context import AgentContext
@@ -23,6 +24,13 @@ from fast_langchain_server.middleware import (
 # ---------------------------------------------------------------------------
 
 
+def _make_request(headers: dict | None = None) -> Request:
+    """Build a minimal Starlette Request with the given headers."""
+    raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
+    scope = {"type": "http", "method": "POST", "headers": raw}
+    return Request(scope)
+
+
 def _ctx(
     session_id: str = "sess-1",
     endpoint: str = "/v1/chat/completions",
@@ -31,7 +39,7 @@ def _ctx(
     ctx = AgentContext.from_request(
         session_id=session_id,
         user_input="hello",
-        headers=headers or {},
+        request=_make_request(headers),
     )
     ctx.set_meta("endpoint", endpoint)
     ctx.set_meta("method", "POST")

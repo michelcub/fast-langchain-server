@@ -377,7 +377,8 @@ ctx.session_id      # resolved session identifier
 ctx.request_id      # UUID for this request
 ctx.user_input      # last user message
 ctx.model           # model name from the request
-ctx.headers         # lowercased HTTP headers dict
+ctx.request         # raw Starlette Request object (None for A2A entry points)
+ctx.headers         # lowercased HTTP headers dict (derived from ctx.request)
 ctx.otel_context    # W3C TraceContext for distributed tracing
 ctx.auth_token      # set by AuthMiddleware (or None)
 
@@ -386,6 +387,19 @@ ctx.get_meta("key", default)
 
 await ctx.emit_progress("tool_call", "search_web")  # push SSE progress event
 ```
+
+The raw `request` object exposes anything from the incoming HTTP request:
+
+```python
+async def on_request(self, ctx: AgentContext, call_next):
+    if ctx.request is not None:
+        client_ip = ctx.request.client.host
+        cookies = ctx.request.cookies
+        query_params = dict(ctx.request.query_params)
+    return await call_next(ctx)
+```
+
+> `ctx.headers` is a convenience property that returns a lower-cased dict of all request headers.  It returns `{}` when `ctx.request` is `None` (e.g. A2A calls).
 
 ---
 
