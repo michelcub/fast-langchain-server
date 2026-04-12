@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue)](https://www.python.org/downloads/)
-[![PyPI version](https://img.shields.io/badge/version-0.1.3-brightgreen)](https://pypi.org/project/fast-langchain-server/)
+[![PyPI version](https://img.shields.io/badge/version-0.2.0-brightgreen)](https://pypi.org/project/fast-langchain-server/)
 
 ## Overview
 
