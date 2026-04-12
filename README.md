@@ -48,7 +48,7 @@ def add(a: float, b: float) -> float:
     """Add two numbers."""
     return a + b
 
-# Create model (with auto-extracted config from environment)
+# Create model
 model = ChatOpenAI(
     model=os.getenv("MODEL_NAME"),
     api_key=os.getenv("MODEL_API_KEY"),
@@ -57,8 +57,13 @@ model = ChatOpenAI(
 
 agent = create_agent(model=model, tools=[add])
 
-# serve() now auto-extracts model config from the agent
-app = serve(agent)
+# Wrap with serve() - pass tools to expose in agent discovery
+app = serve(
+    agent,
+    tools=[add],
+    agent_name="my-agent",
+    agent_description="A helpful assistant with math capabilities"
+)
 ```
 
 Configure environment variables in `.env`:
@@ -84,12 +89,17 @@ fast-langchain-server run agent.py
 fast-langchain-server run agent.py:app
 ```
 
-### Auto-extracted model configuration
+### Configuring the agent
 
-The `serve()` function automatically extracts model configuration from your LangChain agent. This eliminates the need to redundantly specify model settings:
+The `serve()` function provides several ways to configure your agent:
+
+#### Model configuration (auto-extracted)
+
+The model configuration is automatically extracted from your LangChain agent:
 
 ```python
 from langchain_openai import ChatOpenAI
+from langchain.agents import create_agent
 from fast_langchain_server import serve
 
 # Model configured once
@@ -101,16 +111,43 @@ model = ChatOpenAI(
 
 agent = create_agent(model=model, tools=[...])
 
-# serve() extracts everything automatically
-app = serve(agent)  # No additional config needed!
+# serve() extracts model config automatically
+app = serve(agent)
 ```
 
-Environment variables are read as fallback:
+#### Agent identity (name & description)
+
+Customize how your agent appears in discovery:
+
+```python
+app = serve(
+    agent,
+    tools=[my_tool],
+    agent_name="my-agent",
+    agent_description="A helpful assistant"
+)
 ```
+
+#### Tools & skills
+
+Pass tools explicitly to expose them in the agent discovery card:
+
+```python
+app = serve(
+    agent,
+    tools=[add, multiply, search],  # Tools appear in /.well-known/agent.json
+)
+```
+
+#### Environment fallback
+
+If not provided as parameters, settings are read from environment:
+```bash
+AGENT_NAME=my-agent
+AGENT_DESCRIPTION="A helpful assistant"
 MODEL_NAME=gpt-4o
 MODEL_API_URL=https://api.openai.com/v1
 MODEL_API_KEY=sk-...
-AGENT_NAME=my-agent  # Optional; auto-generated if missing
 ```
 
 ---
@@ -156,6 +193,54 @@ curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"messages": [{"role": "user", "content": "And 3+3?"}], "session_id": "abc123"}'
 ```
+
+### Agent discovery card
+
+The `/.well-known/agent.json` endpoint provides machine-readable metadata about your agent, including its tools/skills:
+
+```bash
+curl http://localhost:8000/.well-known/agent.json | jq
+```
+
+Response:
+```json
+{
+  "name": "math-agent",
+  "description": "A helpful math agent",
+  "url": "http://localhost:8000",
+  "version": "0.3.0",
+  "protocolVersion": "0.3.0",
+  "skills": [
+    {
+      "id": "add",
+      "name": "add",
+      "description": "Add two numbers.",
+      "inputModes": ["application/json"],
+      "outputModes": ["application/json"]
+    },
+    {
+      "id": "multiply",
+      "name": "multiply",
+      "description": "Multiply two numbers.",
+      "inputModes": ["application/json"],
+      "outputModes": ["application/json"]
+    }
+  ],
+  "capabilities": {
+    "streaming": true,
+    "memory": true,
+    "memoryBackend": "local",
+    "a2a": false,
+    "pushNotifications": false,
+    "stateTransitionHistory": false
+  },
+  "supportedProtocols": [],
+  "defaultInputModes": ["application/json"],
+  "defaultOutputModes": ["application/json"]
+}
+```
+
+**Skills** are automatically populated from the `tools` parameter passed to `serve()`. Each tool's name and docstring become the skill's `name` and `description`.
 
 ---
 
