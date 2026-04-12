@@ -23,7 +23,10 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
+
+if TYPE_CHECKING:
+    from starlette.requests import Request
 
 
 @dataclass
@@ -40,8 +43,11 @@ class AgentContext:
         The last user message extracted from the request body.
     model:
         Model name from the request (defaults to ``"agent"``).
-    headers:
-        Raw HTTP headers as a lower-cased dict.
+    request:
+        The raw Starlette/FastAPI Request object. Use ``ctx.headers`` to
+        access lower-cased headers, or read any other request attribute
+        (body, cookies, client, etc.) directly.  ``None`` for non-HTTP
+        entry points such as A2A.
     otel_context:
         W3C TraceContext extracted from incoming headers; passed to the OTel
         tracer so that distributed traces are continued end-to-end.
@@ -58,12 +64,23 @@ class AgentContext:
     request_id: str
     user_input: str
     model: str = "agent"
-    headers: dict[str, str] = field(default_factory=dict)
+    request: Optional["Request"] = field(default=None, repr=False)
     otel_context: Any = field(default=None, repr=False)
     _emit: Optional[Callable[[dict], Awaitable[None]]] = field(
         default=None, repr=False
     )
     _metadata: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    # ------------------------------------------------------------------
+    # Request helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def headers(self) -> dict[str, str]:
+        """Lower-cased HTTP headers from the request, or an empty dict."""
+        if self.request is None:
+            return {}
+        return {k.lower(): v for k, v in self.request.headers.items()}
 
     # ------------------------------------------------------------------
     # Progress emission
@@ -119,7 +136,7 @@ class AgentContext:
         session_id: str,
         user_input: str,
         model: str = "agent",
-        headers: dict[str, str],
+        request: Optional["Request"] = None,
         otel_context: Any = None,
     ) -> "AgentContext":
         """Convenience constructor that auto-generates a request_id."""
@@ -128,6 +145,6 @@ class AgentContext:
             request_id=str(uuid.uuid4()),
             user_input=user_input,
             model=model,
-            headers=headers,
+            request=request,
             otel_context=otel_context,
         )

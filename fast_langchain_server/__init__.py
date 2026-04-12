@@ -89,4 +89,4 @@ __all__ = [
     "all_of",
     "any_of",
 ]
-__version__ = "0.5.0"
+__version__ = "0.5.1"

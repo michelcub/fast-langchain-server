@@ -412,14 +412,13 @@ class Server:
             session_id = req.session_id or request.headers.get("X-Session-ID")
             session_id = await self._memory.get_or_create_session(session_id)
 
-            headers = {k.lower(): v for k, v in request.headers.items()}
             otel_context = extract_context(dict(request.headers))
 
             ctx = AgentContext.from_request(
                 session_id=session_id,
                 user_input=last_user,
                 model=req.model,
-                headers=headers,
+                request=request,
                 otel_context=otel_context,
             )
             ctx.set_meta("endpoint", "/v1/chat/completions")
@@ -620,7 +619,6 @@ class Server:
         ctx = AgentContext.from_request(
             session_id=session_id,
             user_input=text,
-            headers={},
         )
         ctx.set_meta("endpoint", "a2a")
         return await self._run_agent(ctx)
