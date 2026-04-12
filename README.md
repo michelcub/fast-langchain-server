@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue)](https://www.python.org/downloads/)
-[![PyPI version](https://img.shields.io/badge/version-0.4.0-brightgreen)](https://pypi.org/project/fast-langchain-server/)
+[![PyPI version](https://img.shields.io/badge/version-0.4.1-brightgreen)](https://pypi.org/project/fast-langchain-server/)
 
 ## Overview
 
@@ -150,6 +150,23 @@ MODEL_API_URL=https://api.openai.com/v1
 MODEL_API_KEY=sk-...
 ```
 
+#### A2A (Agent-to-Agent) support
+
+A2A protocol is **enabled by default**, allowing other agents to communicate with yours:
+
+```python
+# A2A enabled (default)
+app = serve(agent, tools=[my_tool])  # a2a=True
+
+# Disable A2A if not needed
+app = serve(agent, tools=[my_tool], a2a=False)
+```
+
+When A2A is enabled:
+- **`POST /`** endpoint is available for A2A JSON-RPC 2.0 communication
+- **Autonomous execution** support for multi-agent workflows
+- **Agent discovery card** shows `a2a: true` and `supportedProtocols: ["jsonrpc"]`
+
 ---
 
 ## API Endpoints
@@ -162,7 +179,7 @@ MODEL_API_KEY=sk-...
 | `GET` | `/.well-known/agent.json` | A2A agent discovery card |
 | `GET` | `/memory/sessions` | List active sessions |
 | `DELETE` | `/memory/sessions/{id}` | Delete a session |
-| `POST` | `/` | A2A JSON-RPC 2.0 *(when `TASK_MANAGER_TYPE=local`)* |
+| `POST` | `/` | A2A JSON-RPC 2.0 *(enabled by default, set `a2a=False` to disable)* |
 
 ### Chat completions
 
