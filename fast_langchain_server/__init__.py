@@ -23,6 +23,7 @@ Quick start
 """
 
 from fast_langchain_server.server import Server
+from fast_langchain_server.serverutils import inspect_agent
 from fast_langchain_server.context import AgentContext
 from fast_langchain_server.auth import (
     AuthToken,
@@ -58,6 +59,7 @@ from fast_langchain_server.authorization import (
 __all__ = [
     # Server
     "Server",
+    "inspect_agent",
     # Context
     "AgentContext",
     # Auth

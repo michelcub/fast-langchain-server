@@ -84,6 +84,7 @@ from fast_langchain_server.serverutils import (
     build_langchain_model,
     configure_logging,
     extract_text_content,
+    inspect_agent,
 )
 from fast_langchain_server.telemetry import (
     SERVICE_NAME,
@@ -219,7 +220,22 @@ class Server:
         # ── Internal state ────────────────────────────────────────────────────
         self._agent = agent
         self._settings = settings
-        self._tools: list = tools or []
+
+        # Auto-detect tools from the agent graph when not explicitly provided.
+        # tools=None  → inspect the agent (default behaviour)
+        # tools=[]    → caller explicitly wants no tools in the discovery card
+        if tools is None:
+            agent_meta = inspect_agent(agent)
+            self._tools: list = agent_meta["tools"]
+            # Use introspected description only when the caller didn't set one
+            if not agent_description and not settings_kwargs.get("agent_description"):
+                introspected = agent_meta.get("description", "")
+                if introspected:
+                    self._settings = settings.model_copy(
+                        update={"agent_description": introspected}
+                    )
+        else:
+            self._tools = tools
         self._middlewares: list[AgentMiddleware] = []
         self.lifespan_context: dict = {}
         self._lifespan_obj: Lifespan = lifespan or DEFAULT_LIFESPAN
