@@ -658,6 +658,10 @@ def serve(agent: Any, tools: Optional[list] = None, **kwargs: Any) -> FastAPI:
     if not kwargs:
         kwargs = _extract_agent_settings(agent)
 
+    # Extract tools from agent if not provided explicitly
+    if tools is None:
+        tools = _extract_tools_from_agent(agent)
+
     settings = AgentServerSettings(**kwargs)  # type: ignore[call-arg]
     server = create_agent_server(settings=settings, custom_agent=agent, tools=tools or [])
     return server.app
@@ -703,6 +707,60 @@ def _extract_agent_settings(agent: Any) -> dict[str, Any]:
         settings["agent_name"] = agent_name
 
     return settings
+
+
+def _extract_tools_from_agent(agent: Any) -> list[Any]:
+    """Extract tools from a LangChain agent.
+
+    Attempts to find tools in the agent's graph structure.
+    """
+    tools = []
+
+    try:
+        # Try to extract from agent nodes
+        if hasattr(agent, "nodes"):
+            for node_name, node_data in agent.nodes.items():
+                if hasattr(node_data, "runnable"):
+                    runnable = node_data.runnable
+                    # Look for bind_tools call with tools
+                    extracted = _find_tools_in_runnable(runnable)
+                    if extracted:
+                        tools.extend(extracted)
+    except Exception as e:
+        logger.debug(f"Could not auto-extract tools from agent: {e}")
+
+    return tools
+
+
+def _find_tools_in_runnable(runnable: Any) -> list[Any]:
+    """Recursively search a runnable for tools."""
+    tools = []
+
+    if runnable is None:
+        return tools
+
+    # Check if this is a tool-bound model (has kwargs with tools)
+    if hasattr(runnable, "kwargs") and "tools" in runnable.kwargs:
+        tools.extend(runnable.kwargs["tools"])
+        return tools
+
+    # Check nested runnables
+    if hasattr(runnable, "first"):
+        tools.extend(_find_tools_in_runnable(runnable.first))
+    if hasattr(runnable, "middle"):
+        if isinstance(runnable.middle, list):
+            for item in runnable.middle:
+                tools.extend(_find_tools_in_runnable(item))
+        else:
+            tools.extend(_find_tools_in_runnable(runnable.middle))
+    if hasattr(runnable, "last"):
+        tools.extend(_find_tools_in_runnable(runnable.last))
+
+    if hasattr(runnable, "steps"):
+        for step in runnable.steps:
+            tools.extend(_find_tools_in_runnable(step))
+
+    return tools
 
 
 def _extract_model_from_runnable(runnable: Any, settings: dict[str, Any]) -> bool:
