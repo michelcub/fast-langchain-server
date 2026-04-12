@@ -618,6 +618,90 @@ def serve(agent: Any, tools: Optional[list] = None, **kwargs: Any) -> FastAPI:
     agent = create_agent("openai:gpt-4o", tools=[my_tool])
     app = serve(agent, tools=[my_tool])
     """
-    settings = AgentServerSettings(**kwargs) if kwargs else AgentServerSettings()  # type: ignore[call-arg]
+    # Extract model info from agent if not provided in kwargs
+    if not kwargs:
+        kwargs = _extract_agent_settings(agent)
+
+    settings = AgentServerSettings(**kwargs)  # type: ignore[call-arg]
     server = create_agent_server(settings=settings, custom_agent=agent, tools=tools or [])
     return server.app
+
+
+def _extract_agent_settings(agent: Any) -> dict[str, Any]:
+    """Extract model configuration from a LangChain agent.
+
+    Attempts to find the ChatOpenAI model instance within the agent graph
+    and extract base_url and model name. Also checks environment variables.
+    """
+    import os
+
+    settings = {}
+
+    try:
+        # Try to find the model in the agent's graph nodes
+        if hasattr(agent, "nodes"):
+            for node_name, node_data in agent.nodes.items():
+                if hasattr(node_data, "runnable"):
+                    runnable = node_data.runnable
+                    # Look for ChatOpenAI in the runnable
+                    if _extract_model_from_runnable(runnable, settings):
+                        break
+
+        # Fallback: check if agent has a direct reference to the model
+        if not settings and hasattr(agent, "runnable"):
+            _extract_model_from_runnable(agent.runnable, settings)
+    except Exception as e:
+        logger.warning(f"Could not auto-extract model settings: {e}")
+
+    # Try to get model info from environment variables if not found in agent
+    if "model_name" not in settings:
+        settings["model_name"] = os.getenv("MODEL_NAME") or os.getenv("OPENAI_MODEL")
+    if "model_api_url" not in settings:
+        settings["model_api_url"] = os.getenv("MODEL_API_URL") or os.getenv("OPENAI_BASE_URL")
+
+    # Generate a default agent name if not found
+    if "agent_name" not in settings:
+        agent_name = os.getenv("AGENT_NAME")
+        if not agent_name:
+            agent_name = f"agent-{uuid.uuid4().hex[:8]}"
+        settings["agent_name"] = agent_name
+
+    return settings
+
+
+def _extract_model_from_runnable(runnable: Any, settings: dict[str, Any]) -> bool:
+    """Recursively search a runnable for ChatOpenAI model and extract settings."""
+    if runnable is None:
+        return False
+
+    # Check if this is a ChatOpenAI instance
+    if type(runnable).__name__ == "ChatOpenAI":
+        if hasattr(runnable, "model_name"):
+            settings["model_name"] = runnable.model_name
+        if hasattr(runnable, "base_url"):
+            settings["model_api_url"] = runnable.base_url
+        return bool(settings.get("model_name") and settings.get("model_api_url"))
+
+    # Check nested runnables
+    if hasattr(runnable, "first"):
+        if _extract_model_from_runnable(runnable.first, settings):
+            return True
+    if hasattr(runnable, "middle"):
+        if isinstance(runnable.middle, list):
+            for item in runnable.middle:
+                if _extract_model_from_runnable(item, settings):
+                    return True
+        else:
+            if _extract_model_from_runnable(runnable.middle, settings):
+                return True
+    if hasattr(runnable, "last"):
+        if _extract_model_from_runnable(runnable.last, settings):
+            return True
+
+    # Check steps in a sequence
+    if hasattr(runnable, "steps"):
+        for step in runnable.steps:
+            if _extract_model_from_runnable(step, settings):
+                return True
+
+    return False
