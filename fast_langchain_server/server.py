@@ -643,20 +643,50 @@ def get_app() -> FastAPI:
     return create_agent_server().app
 
 
-def serve(agent: Any, tools: Optional[list] = None, **kwargs: Any) -> FastAPI:
+def serve(
+    agent: Any,
+    tools: Optional[list] = None,
+    agent_name: Optional[str] = None,
+    agent_description: Optional[str] = None,
+    **kwargs: Any
+) -> FastAPI:
     """One-liner to wrap an existing agent as a FastAPI ASGI app.
+
+    Parameters
+    ----------
+    agent : CompiledStateGraph
+        A LangChain/LangGraph agent (from create_agent()).
+    tools : list, optional
+        List of tools to expose in the agent discovery card.
+    agent_name : str, optional
+        Name for the agent. Falls back to AGENT_NAME env var or auto-generated.
+    agent_description : str, optional
+        Description for the agent. Falls back to AGENT_DESCRIPTION env var.
+    **kwargs
+        Additional settings passed to AgentServerSettings.
 
     Example
     -------
     from langchain.agents import create_agent
     from fast_langchain_server import serve
 
-    agent = create_agent("openai:gpt-4o", tools=[my_tool])
-    app = serve(agent, tools=[my_tool])
+    agent = create_agent(model=model, tools=[my_tool])
+    app = serve(
+        agent,
+        tools=[my_tool],
+        agent_name="my-agent",
+        agent_description="My custom agent"
+    )
     """
     # Extract model info from agent if not provided in kwargs
     if not kwargs:
         kwargs = _extract_agent_settings(agent)
+
+    # Allow overriding agent name and description via parameters
+    if agent_name:
+        kwargs["agent_name"] = agent_name
+    if agent_description:
+        kwargs["agent_description"] = agent_description
 
     settings = AgentServerSettings(**kwargs)  # type: ignore[call-arg]
     server = create_agent_server(settings=settings, custom_agent=agent, tools=tools or [])
