@@ -19,8 +19,8 @@ auth = EnvAPIKeyProvider()          # reads AGENT_API_KEYS env var
 # Composed providers (JWT first, API key fallback)
 auth = JWTProvider(jwks_url="...", audience="my-agent") | EnvAPIKeyProvider()
 
-# Pass to create_agent_server (wired in Fase 3 via AuthMiddleware)
-server = create_agent_server(tools=[...])
+# Pass to Server via add_middleware
+server = Server(agent, tools=[...])
 server.add_middleware(AuthMiddleware(provider=auth))
 """
 from __future__ import annotations
