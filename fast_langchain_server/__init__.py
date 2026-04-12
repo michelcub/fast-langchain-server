@@ -23,6 +23,39 @@ app = serve(agent, tools=[add])   # FastAPI ASGI app
 """
 
 from fast_langchain_server.server import create_agent_server, serve
+from fast_langchain_server.context import AgentContext
+from fast_langchain_server.auth import (
+    AuthToken,
+    AuthProvider,
+    APIKeyProvider,
+    EnvAPIKeyProvider,
+    JWTProvider,
+    MultiAuth,
+)
+from fast_langchain_server.middleware import (
+    AgentMiddleware,
+    AuthMiddleware,
+    TimingMiddleware,
+    RateLimitMiddleware,
+)
 
-__all__ = ["serve", "create_agent_server"]
+__all__ = [
+    # Server
+    "serve",
+    "create_agent_server",
+    # Context
+    "AgentContext",
+    # Auth
+    "AuthToken",
+    "AuthProvider",
+    "APIKeyProvider",
+    "EnvAPIKeyProvider",
+    "JWTProvider",
+    "MultiAuth",
+    # Middleware
+    "AgentMiddleware",
+    "AuthMiddleware",
+    "TimingMiddleware",
+    "RateLimitMiddleware",
+]
 __version__ = "0.1.0"
