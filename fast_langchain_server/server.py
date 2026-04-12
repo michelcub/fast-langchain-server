@@ -56,6 +56,7 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from fast_langchain_server.context import AgentContext
+from fast_langchain_server.lifespan import DEFAULT_LIFESPAN, Lifespan
 from fast_langchain_server.middleware import AgentMiddleware, build_middleware_chain
 from fast_langchain_server.a2a import (
     LocalTaskManager,
@@ -74,7 +75,6 @@ from fast_langchain_server.telemetry import (
     SERVICE_NAME,
     extract_context,
     init_otel,
-    is_otel_enabled,
 )
 
 logger = logging.getLogger(__name__)
@@ -128,6 +128,7 @@ class AgentServer:
         memory: Optional[Memory] = None,
         tools: Optional[list] = None,
         task_manager: Optional[TaskManager] = None,
+        lifespan: Optional[Lifespan] = None,
     ) -> None:
         self._agent = agent
         self._settings = settings
@@ -135,6 +136,8 @@ class AgentServer:
         self._tools: list = tools or []
         self._task_manager: TaskManager = task_manager or NullTaskManager()
         self._middlewares: list[AgentMiddleware] = []
+        self.lifespan_context: dict = {}
+        self._lifespan_obj: Lifespan = lifespan or DEFAULT_LIFESPAN
 
         self._app = FastAPI(
             title=settings.agent_name,
@@ -147,51 +150,11 @@ class AgentServer:
 
     @asynccontextmanager
     async def _lifespan(self, app: FastAPI):
-        # Initialise OTel (idempotent — safe to call even if already done)
-        if self._settings.otel_active:
-            init_otel(self._settings.agent_name)
-
-        a2a_active = not isinstance(self._task_manager, NullTaskManager)
-        logger.info(
-            "Agent '%s' starting on port %d (memory=%s otel=%s a2a=%s)",
-            self._settings.agent_name,
-            self._settings.agent_port,
-            self._settings.memory_type,
-            is_otel_enabled(),
-            a2a_active,
-        )
-
-        # ── Autonomous execution ──────────────────────────────────────────
-        # If AUTONOMOUS_GOAL is set and a LocalTaskManager is available,
-        # kick off the autonomous loop as a background task at startup.
-        if self._settings.autonomous_goal and a2a_active:
-            from fast_langchain_server.a2a import AutonomousConfig
-
-            auto_cfg = AutonomousConfig(
-                goal=self._settings.autonomous_goal,
-                interval_seconds=self._settings.autonomous_interval_seconds,
-                max_iter_runtime_seconds=self._settings.autonomous_max_iter_runtime_seconds,
-            )
-            logger.info(
-                "Starting autonomous loop: goal='%s' interval=%ds",
-                self._settings.autonomous_goal[:80],
-                self._settings.autonomous_interval_seconds,
-            )
-            await self._task_manager.submit_autonomous(
-                goal=self._settings.autonomous_goal,
-                autonomous_config=auto_cfg,
-            )
-        elif self._settings.autonomous_goal and not a2a_active:
-            logger.warning(
-                "AUTONOMOUS_GOAL is set but TASK_MANAGER_TYPE=none — "
-                "autonomous loop will not start. Set TASK_MANAGER_TYPE=local."
-            )
-
-        yield
-
-        logger.info("Agent '%s' shutting down", self._settings.agent_name)
-        await self._task_manager.shutdown()
-        await self._memory.close()
+        """FastAPI lifespan hook — delegates to the composable Lifespan object."""
+        async with self._lifespan_obj._as_cm(self) as ctx:
+            self.lifespan_context.update(ctx)
+            yield
+            self.lifespan_context.clear()
 
     # ── Middleware registration ───────────────────────────────────────────────
 
@@ -567,6 +530,7 @@ def create_agent_server(
     tools: Optional[list] = None,
     custom_agent: Any = None,
     system_prompt: Optional[str] = None,
+    lifespan: Optional[Lifespan] = None,
 ) -> AgentServer:
     """Build a fully wired AgentServer from environment variables.
 
@@ -582,6 +546,20 @@ def create_agent_server(
     system_prompt:
         Override the system prompt from settings.  Ignored when
         ``custom_agent`` is provided.
+    lifespan:
+        Custom composable ``Lifespan`` (or ``ComposedLifespan``) to use instead
+        of the built-in ``DEFAULT_LIFESPAN``.  Compose additional lifespans with
+        ``|``::
+
+            from fast_langchain_server.lifespan import lifespan, DEFAULT_LIFESPAN
+
+            @lifespan
+            async def my_db(server):
+                server.lifespan_context["db"] = await connect()
+                yield {}
+                await server.lifespan_context["db"].close()
+
+            server = create_agent_server(lifespan=DEFAULT_LIFESPAN | my_db)
 
     Examples
     --------
@@ -640,6 +618,7 @@ def create_agent_server(
         memory=memory,
         tools=tools or [],
         task_manager=NullTaskManager(),  # replaced below if needed
+        lifespan=lifespan,
     )
 
     if settings.task_manager_type == "local":

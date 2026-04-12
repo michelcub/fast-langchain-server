@@ -38,6 +38,22 @@ from fast_langchain_server.middleware import (
     TimingMiddleware,
     RateLimitMiddleware,
 )
+from fast_langchain_server.lifespan import (
+    Lifespan,
+    lifespan,
+    DEFAULT_LIFESPAN,
+)
+from fast_langchain_server.authorization import (
+    AuthContext,
+    AuthCheck,
+    AuthorizationMiddleware,
+    require_scopes,
+    allow_any_authenticated,
+    allow_own_session,
+    deny_all,
+    all_of,
+    any_of,
+)
 
 __all__ = [
     # Server
@@ -57,5 +73,19 @@ __all__ = [
     "AuthMiddleware",
     "TimingMiddleware",
     "RateLimitMiddleware",
+    # Lifespan
+    "Lifespan",
+    "lifespan",
+    "DEFAULT_LIFESPAN",
+    # Authorization
+    "AuthContext",
+    "AuthCheck",
+    "AuthorizationMiddleware",
+    "require_scopes",
+    "allow_any_authenticated",
+    "allow_own_session",
+    "deny_all",
+    "all_of",
+    "any_of",
 ]
 __version__ = "0.1.0"
