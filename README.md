@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue)](https://www.python.org/downloads/)
-[![PyPI version](https://img.shields.io/badge/version-0.2.0-brightgreen)](https://pypi.org/project/fast-langchain-server/)
+[![PyPI version](https://img.shields.io/badge/version-0.3.0-brightgreen)](https://pypi.org/project/fast-langchain-server/)
 
 ## Overview
 
@@ -38,28 +38,39 @@ pip install fast-langchain-server
 ```python
 # agent.py
 from langchain.agents import create_agent
+from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from fast_langchain_server import serve
+import os
 
 @tool
 def add(a: float, b: float) -> float:
     """Add two numbers."""
     return a + b
 
-agent = create_agent(
-    model="openai:gpt-4o",
-    tools=[add],
-    system_prompt="You are a helpful assistant.",
+# Create model (with auto-extracted config from environment)
+model = ChatOpenAI(
+    model=os.getenv("MODEL_NAME"),
+    api_key=os.getenv("MODEL_API_KEY"),
+    base_url=os.getenv("MODEL_API_URL"),
 )
 
-app = serve(agent, tools=[add])
+agent = create_agent(model=model, tools=[add])
+
+# serve() now auto-extracts model config from the agent
+app = serve(agent)
 ```
 
+Configure environment variables in `.env`:
 ```bash
-AGENT_NAME=my-agent \
-MODEL_API_URL=https://api.openai.com/v1 \
-MODEL_NAME=gpt-4o \
-MODEL_API_KEY=sk-... \
+AGENT_NAME=my-agent
+MODEL_NAME=gpt-4o
+MODEL_API_URL=https://api.openai.com/v1
+MODEL_API_KEY=sk-...
+```
+
+Run:
+```bash
 uvicorn agent:app
 ```
 
@@ -71,6 +82,35 @@ fast-langchain-server run agent.py
 
 # Explicit attribute
 fast-langchain-server run agent.py:app
+```
+
+### Auto-extracted model configuration
+
+The `serve()` function automatically extracts model configuration from your LangChain agent. This eliminates the need to redundantly specify model settings:
+
+```python
+from langchain_openai import ChatOpenAI
+from fast_langchain_server import serve
+
+# Model configured once
+model = ChatOpenAI(
+    model="gpt-4o",
+    api_key="sk-...",
+    base_url="https://api.openai.com/v1",
+)
+
+agent = create_agent(model=model, tools=[...])
+
+# serve() extracts everything automatically
+app = serve(agent)  # No additional config needed!
+```
+
+Environment variables are read as fallback:
+```
+MODEL_NAME=gpt-4o
+MODEL_API_URL=https://api.openai.com/v1
+MODEL_API_KEY=sk-...
+AGENT_NAME=my-agent  # Optional; auto-generated if missing
 ```
 
 ---
