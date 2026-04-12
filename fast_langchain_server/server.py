@@ -55,6 +55,8 @@ from opentelemetry import trace as trace_api
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
+from fast_langchain_server.context import AgentContext
+from fast_langchain_server.middleware import AgentMiddleware, build_middleware_chain
 from fast_langchain_server.a2a import (
     LocalTaskManager,
     NullTaskManager,
@@ -132,6 +134,7 @@ class AgentServer:
         self._memory: Memory = memory or NullMemory()
         self._tools: list = tools or []
         self._task_manager: TaskManager = task_manager or NullTaskManager()
+        self._middlewares: list[AgentMiddleware] = []
 
         self._app = FastAPI(
             title=settings.agent_name,
@@ -190,6 +193,19 @@ class AgentServer:
         await self._task_manager.shutdown()
         await self._memory.close()
 
+    # ── Middleware registration ───────────────────────────────────────────────
+
+    def add_middleware(self, middleware: AgentMiddleware) -> "AgentServer":
+        """Append a middleware to the chain.
+
+        Middlewares execute in the order they are added (first added = outermost
+        wrapper).  Returns ``self`` to allow chaining::
+
+            server.add_middleware(TimingMiddleware()).add_middleware(RateLimitMiddleware())
+        """
+        self._middlewares.append(middleware)
+        return self
+
     # ── Route setup ───────────────────────────────────────────────────────────
 
     def _setup_routes(self) -> None:
@@ -232,22 +248,46 @@ class AgentServer:
             session_id = req.session_id or request.headers.get("X-Session-ID")
             session_id = await self._memory.get_or_create_session(session_id)
 
-            # Extract parent W3C trace context from incoming headers
-            parent_ctx = extract_context(dict(request.headers))
+            headers = {k.lower(): v for k, v in request.headers.items()}
+            otel_context = extract_context(dict(request.headers))
+
+            ctx = AgentContext.from_request(
+                session_id=session_id,
+                user_input=last_user,
+                model=req.model,
+                headers=headers,
+                otel_context=otel_context,
+            )
+            ctx.set_meta("endpoint", "/v1/chat/completions")
+            ctx.set_meta("method", "POST")
 
             if req.stream:
-                return StreamingResponse(
-                    self._stream_response(last_user, session_id, req.model, parent_ctx),
-                    media_type="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                # For streaming we only run the middleware chain for the
+                # on_request hook (auth, rate-limit, etc.) before handing off
+                # the generator.  The generator itself is not wrapped because
+                # it yields bytes incrementally.
+                async def _stream_handler(c: AgentContext) -> StreamingResponse:
+                    return StreamingResponse(
+                        self._stream_response(c),
+                        media_type="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                    )
+
+                chain = build_middleware_chain(
+                    self._middlewares, _stream_handler, hook="on_request"
+                )
+                return await chain(ctx)
+
+            async def _run_handler(c: AgentContext) -> JSONResponse:
+                response_text, _tool_calls = await self._run_agent(c)
+                return JSONResponse(
+                    self._build_completion(response_text, c.session_id, c.model)
                 )
 
-            response_text, tool_call_count = await self._run_agent(
-                last_user, session_id, parent_ctx
+            chain = build_middleware_chain(
+                self._middlewares, _run_handler, hook="on_request"
             )
-            return JSONResponse(
-                self._build_completion(response_text, session_id, req.model)
-            )
+            return await chain(ctx)
 
         # ── Memory management ─────────────────────────────────────────────────
         @app.get("/memory/sessions")
@@ -269,25 +309,23 @@ class AgentServer:
 
     # ── Non-streaming execution ───────────────────────────────────────────────
 
-    async def _run_agent(
-        self, user_input: str, session_id: str, parent_ctx=None
-    ) -> Tuple[str, int]:
+    async def _run_agent(self, ctx: AgentContext) -> Tuple[str, int]:
         """Run the agent and return (response_text, tool_call_count)."""
         tracer = trace_api.get_tracer(SERVICE_NAME)
 
         with tracer.start_as_current_span(
             "fls.server.run",
-            context=parent_ctx,
+            context=ctx.otel_context,
             attributes={
                 "agent.name": self._settings.agent_name,
-                "session.id": session_id,
+                "session.id": ctx.session_id,
                 "stream": False,
             },
         ) as span:
             history = await self._memory.get_messages(
-                session_id, self._settings.memory_context_limit
+                ctx.session_id, self._settings.memory_context_limit
             )
-            input_messages = history + [HumanMessage(content=user_input)]
+            input_messages = history + [HumanMessage(content=ctx.user_input)]
 
             try:
                 result = await self._agent.ainvoke({"messages": input_messages})
@@ -301,7 +339,7 @@ class AgentServer:
             if not all_messages:
                 raise HTTPException(status_code=500, detail="Agent returned no messages")
 
-            await self._memory.save_messages(session_id, all_messages)
+            await self._memory.save_messages(ctx.session_id, all_messages)
 
             final = all_messages[-1]
             response_text = extract_text_content(final.content)
@@ -317,7 +355,7 @@ class AgentServer:
     # ── Streaming execution ───────────────────────────────────────────────────
 
     async def _stream_response(
-        self, user_input: str, session_id: str, model: str, parent_ctx=None
+        self, ctx: AgentContext
     ) -> AsyncGenerator[str, None]:
         """
         Async generator that yields SSE-formatted strings.
@@ -336,23 +374,32 @@ class AgentServer:
         """
         tracer = trace_api.get_tracer(SERVICE_NAME)
 
+        # Wire ctx._emit so that deep call sites can push progress events via
+        # ctx.emit_progress() without knowing about the SSE transport.
+        pending_events: list[dict] = []
+
+        async def _emit(event: dict) -> None:
+            pending_events.append(event)
+
+        ctx._emit = _emit
+
         # The span must stay open across the whole generator, so we use a
         # context-manager approach without 'with' (enter/exit manually).
         span = tracer.start_span(
             "fls.server.stream",
-            context=parent_ctx,
+            context=ctx.otel_context,
             attributes={
                 "agent.name": self._settings.agent_name,
-                "session.id": session_id,
+                "session.id": ctx.session_id,
                 "stream": True,
             },
         )
 
         history = await self._memory.get_messages(
-            session_id, self._settings.memory_context_limit
+            ctx.session_id, self._settings.memory_context_limit
         )
-        input_messages = history + [HumanMessage(content=user_input)]
-        response_id = str(uuid.uuid4())
+        input_messages = history + [HumanMessage(content=ctx.user_input)]
+        response_id = ctx.request_id
         accumulated_new: list = []
         announced_tools: set[str] = set()
         total_tool_calls = 0
@@ -362,6 +409,11 @@ class AgentServer:
                 {"messages": input_messages},
                 stream_mode=["messages", "updates"],
             ):
+                # Flush any progress events queued by ctx.emit_progress()
+                for event in pending_events:
+                    yield f"data: {json.dumps(event)}\n\n"
+                pending_events.clear()
+
                 if mode == "messages":
                     chunk, _metadata = data
 
@@ -372,12 +424,11 @@ class AgentServer:
                             if tool_name and tool_name not in announced_tools:
                                 announced_tools.add(tool_name)
                                 total_tool_calls += 1
-                                progress = {
-                                    "type": "progress",
-                                    "action": "tool_call",
-                                    "target": tool_name,
-                                }
-                                yield f"data: {json.dumps(progress)}\n\n"
+                                await ctx.emit_progress("tool_call", tool_name)
+                                # Flush immediately so the client sees it now
+                                for event in pending_events:
+                                    yield f"data: {json.dumps(event)}\n\n"
+                                pending_events.clear()
 
                         # Stream LLM tokens
                         if chunk.content:
@@ -385,7 +436,7 @@ class AgentServer:
                                 "id": response_id,
                                 "object": "chat.completion.chunk",
                                 "created": int(time.time()),
-                                "model": model,
+                                "model": ctx.model,
                                 "choices": [
                                     {
                                         "index": 0,
@@ -404,7 +455,7 @@ class AgentServer:
                             accumulated_new.append(msg)
 
             await self._memory.save_messages(
-                session_id, input_messages + accumulated_new
+                ctx.session_id, input_messages + accumulated_new
             )
 
             span.set_attribute("tool_calls", total_tool_calls)
@@ -426,7 +477,13 @@ class AgentServer:
         The task manager calls this function with each iteration message and
         expects ``(response_text, tool_call_count)``.
         """
-        return await self._run_agent(text, session_id)
+        ctx = AgentContext.from_request(
+            session_id=session_id,
+            user_input=text,
+            headers={},
+        )
+        ctx.set_meta("endpoint", "a2a")
+        return await self._run_agent(ctx)
 
     # ── Agent discovery card ──────────────────────────────────────────────────
 
