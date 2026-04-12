@@ -7,15 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Planned for v0.2.0
-- Batching API for multiple agent invocations
-- Custom session backends (PostgreSQL, DynamoDB)
-- Cost tracking and rate limiting per agent
-
 ### Planned for v1.0.0
 - Agent versioning and canary deployments
 - Built-in monitoring dashboard
 - WebSocket support for real-time bidirectional communication
+- Batching API for multiple agent invocations
+- Custom session backends (PostgreSQL, DynamoDB)
+
+---
+
+## [0.2.0] - 2026-04-12
+
+### Added
+
+#### AgentContext (`fast_langchain_server/context.py`)
+- `AgentContext` dataclass that bundles all per-request state into a single
+  object: `session_id`, `request_id`, `user_input`, `model`, `headers`,
+  `otel_context`
+- `emit_progress(action, target)` — async helper that pushes SSE progress
+  events from anywhere in the call stack without coupling to the transport
+- `set_meta / get_meta` — arbitrary metadata bag for middleware communication
+- `auth_token` and `endpoint` convenience properties
+- `AgentContext.from_request()` factory that auto-generates a UUID request ID
+
+#### Authentication (`fast_langchain_server/auth.py`)
+- `AuthToken` dataclass — verified identity with `subject`, `scopes`,
+  `claims`, and `raw` token; `has_scope / has_all_scopes` helpers
+- `AuthProvider` ABC with `|` operator for composing providers (`MultiAuth`)
+- `APIKeyProvider` — validates against a static `{key: owner}` dict
+- `EnvAPIKeyProvider` — reads comma-separated keys from `AGENT_API_KEYS`
+  (or any custom env var) at startup
+- `JWTProvider` — validates Bearer tokens against a JWKS endpoint using
+  PyJWT; supports RS256, custom audience/issuer, `scope` and `scp` claims
+- `MultiAuth` — chains providers in order; first successful match wins;
+  created automatically via the `|` operator
+
+#### Middleware (`fast_langchain_server/middleware.py`)
+- `AgentMiddleware` ABC with `on_request` and `on_agent_run` hooks
+- `build_middleware_chain()` — builds an async callable chain from a list of
+  middlewares and a terminal handler; supports any hook name
+- `AgentServer.add_middleware()` — fluent API for registering middlewares;
+  returns `self` for chaining
+- `AuthMiddleware` — reads `Authorization: Bearer` or `X-API-Key` headers,
+  calls `AuthProvider.verify_token`, sets `ctx.auth_token`; configurable
+  exclusion list (defaults: `/health`, `/ready`, `/.well-known/agent.json`)
+- `TimingMiddleware` — logs elapsed wall-clock time per request
+- `RateLimitMiddleware` — per-session token-bucket rate limiter (default
+  60 req/min); each session has an independent bucket
+
+#### Lifespan (`fast_langchain_server/lifespan.py`)
+- `@lifespan` decorator — wraps an async generator into a composable
+  `Lifespan` object
+- `Lifespan` class with `|` operator for left-to-right composition
+- `ComposedLifespan` — enters left-to-right, exits right-to-left (LIFO);
+  merges yielded context dicts (right wins on collision)
+- `DEFAULT_LIFESPAN` — pre-composed from four focused built-ins:
+  `_otel_lifespan`, `_log_lifespan`, `_autonomous_lifespan`,
+  `_shutdown_lifespan`
+- `server.lifespan_context` dict populated at startup for runtime access
+- `create_agent_server(lifespan=...)` parameter to supply a custom lifespan
+
+#### Authorization (`fast_langchain_server/authorization.py`)
+- `AuthContext` dataclass — `token`, `endpoint`, `method`, `session_id`
+- `AuthCheck` type alias — sync or async `(AuthContext) -> bool`
+- `run_auth_check()` — unified executor for sync/async checks; exceptions
+  fail closed (treated as denial)
+- Built-in checks: `require_scopes(*scopes)`, `allow_any_authenticated()`,
+  `allow_own_session()`, `deny_all()`
+- Composition helpers: `all_of(*checks)` (AND), `any_of(*checks)` (OR)
+- `AuthorizationMiddleware` — applies per-endpoint `AuthCheck` rules;
+  raises `HTTP 403` on denial
+
+### Changed
+
+- `AgentServer._run_agent(ctx)` and `_stream_response(ctx)` now accept a
+  single `AgentContext` instead of loose positional arguments
+- `AgentServer._process_fn` builds an `AgentContext` internally for A2A calls
+- The monolithic `_lifespan` method is replaced by `DEFAULT_LIFESPAN`
+  delegation; startup/shutdown logic lives in individual lifespan functions
+- Chat completions handler wraps execution in the middleware chain before
+  invoking the agent
+
+### Tests
+
+- 103 new tests across 5 files — `test_context.py`, `test_auth.py`,
+  `test_middleware.py`, `test_lifespan.py`, `test_authorization.py`
+- Total test count: 185
 
 ---
 
