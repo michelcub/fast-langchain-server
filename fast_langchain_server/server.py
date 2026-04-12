@@ -134,11 +134,17 @@ class AgentServer:
         self._agent = agent
         self._settings = settings
         self._memory: Memory = memory or NullMemory()
-        self._tools: list = tools or []
         self._task_manager: TaskManager = task_manager or NullTaskManager()
         self._middlewares: list[AgentMiddleware] = []
         self.lifespan_context: dict = {}
         self._lifespan_obj: Lifespan = lifespan or DEFAULT_LIFESPAN
+
+        # Introspect the graph once at startup so _build_agent_card() is cheap.
+        # Falls back to empty dict for custom graphs that don't follow the
+        # standard create_react_agent structure.
+        _agent_meta = inspect_agent(agent)
+        self._tools: list = tools if tools is not None else _agent_meta.get("tools", [])
+        self._agent_description: str = _agent_meta.get("description", "")
 
         self._app = FastAPI(
             title=settings.agent_name,
@@ -452,9 +458,6 @@ class AgentServer:
     # ── Agent discovery card ──────────────────────────────────────────────────
 
     def _build_agent_card(self) -> dict:
-        # If no tools were explicitly registered, attempt introspection
-        tools = self._tools or inspect_agent(self._agent).get("tools", [])
-
         skills = [
             {
                 "id": getattr(t, "name", str(t)),
@@ -463,16 +466,14 @@ class AgentServer:
                 "inputModes": ["application/json"],
                 "outputModes": ["application/json"],
             }
-            for t in tools
+            for t in self._tools
         ]
 
-        # Use the explicit description from settings; fall back to the system
-        # prompt extracted from the agent when the setting is still the default.
+        # Prefer the explicit AGENT_DESCRIPTION setting; fall back to the
+        # system prompt extracted from the graph at startup.
         description = self._settings.agent_description
-        if description == "AI Agent":
-            introspected = inspect_agent(self._agent).get("description", "")
-            if introspected:
-                description = introspected
+        if description == "AI Agent" and self._agent_description:
+            description = self._agent_description
 
         a2a_active = not isinstance(self._task_manager, NullTaskManager)
 

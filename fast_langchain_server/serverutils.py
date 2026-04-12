@@ -106,9 +106,14 @@ class AgentServerSettings(BaseSettings):
         )
 
 
+def parse_log_level(level: str) -> int:
+    """Convert a log level string (e.g. ``"INFO"``) to a :mod:`logging` constant."""
+    return getattr(logging, level.upper(), logging.INFO)
+
+
 def configure_logging(level: str = "INFO", otel_correlation: bool = False) -> None:
     """Configure root logger with a structured format."""
-    numeric = getattr(logging, level.upper(), logging.INFO)
+    numeric = parse_log_level(level)
     logging.basicConfig(
         level=numeric,
         format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",

@@ -35,6 +35,7 @@ from typing import Any, Awaitable, Callable
 from fastapi import HTTPException
 
 from fast_langchain_server.context import AgentContext
+from fast_langchain_server.serverutils import parse_log_level
 
 logger = logging.getLogger(__name__)
 
@@ -104,12 +105,14 @@ def build_middleware_chain(
 
     chain = _final
     for mw in reversed(middlewares):
-        method = getattr(mw, hook)
-        # Capture current chain in closure
-        _next = chain
-
-        async def _wrap(ctx: AgentContext, _m=method, _n=_next) -> Any:
-            return await _m(ctx, _n)
+        # Default argument binding captures current loop values in the closure,
+        # preventing all iterations from referencing the last value.
+        async def _wrap(
+            ctx: AgentContext,
+            _method=getattr(mw, hook),
+            _next=chain,
+        ) -> Any:
+            return await _method(ctx, _next)
 
         chain = _wrap
 
@@ -217,7 +220,7 @@ class TimingMiddleware(AgentMiddleware):
     """
 
     def __init__(self, log_level: str = "INFO") -> None:
-        self._level = getattr(logging, log_level.upper(), logging.INFO)
+        self._level = parse_log_level(log_level)
 
     async def on_request(self, ctx: AgentContext, call_next: CallNext) -> Any:
         start = time.monotonic()
