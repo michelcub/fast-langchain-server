@@ -648,6 +648,7 @@ def serve(
     tools: Optional[list] = None,
     agent_name: Optional[str] = None,
     agent_description: Optional[str] = None,
+    a2a: bool = True,
     **kwargs: Any
 ) -> FastAPI:
     """One-liner to wrap an existing agent as a FastAPI ASGI app.
@@ -662,6 +663,9 @@ def serve(
         Name for the agent. Falls back to AGENT_NAME env var or auto-generated.
     agent_description : str, optional
         Description for the agent. Falls back to AGENT_DESCRIPTION env var.
+    a2a : bool, default=True
+        Enable A2A (Agent-to-Agent) JSON-RPC 2.0 protocol support.
+        Set to False to disable A2A and reduce resource usage.
     **kwargs
         Additional settings passed to AgentServerSettings.
 
@@ -675,8 +679,12 @@ def serve(
         agent,
         tools=[my_tool],
         agent_name="my-agent",
-        agent_description="My custom agent"
+        agent_description="My custom agent",
+        a2a=True  # Enabled by default
     )
+
+    # Disable A2A if not needed:
+    app = serve(agent, tools=[my_tool], a2a=False)
     """
     # Extract model info from agent if not provided in kwargs
     if not kwargs:
@@ -687,6 +695,9 @@ def serve(
         kwargs["agent_name"] = agent_name
     if agent_description:
         kwargs["agent_description"] = agent_description
+
+    # Set task manager type based on a2a parameter
+    kwargs["task_manager_type"] = "local" if a2a else "none"
 
     settings = AgentServerSettings(**kwargs)  # type: ignore[call-arg]
     server = create_agent_server(settings=settings, custom_agent=agent, tools=tools or [])
