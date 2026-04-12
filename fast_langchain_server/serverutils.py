@@ -59,7 +59,7 @@ class AgentServerSettings(BaseSettings):
 
     # ── A2A task manager ──────────────────────────────────────────────────────
     task_manager_type: str = Field(
-        "none",
+        "local",
         description="A2A task manager: 'none' disables A2A, 'local' enables JSON-RPC endpoint",
     )
     task_manager_max_tasks: int = Field(
