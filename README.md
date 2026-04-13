@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue)](https://www.python.org/downloads/)
-[![PyPI version](https://img.shields.io/badge/version-0.5.0-brightgreen)](https://pypi.org/project/fast-langchain-server/)
+[![PyPI version](https://img.shields.io/badge/version-0.6.0-brightgreen)](https://pypi.org/project/fast-langchain-server/)
 
 ## Overview
 
@@ -278,6 +278,45 @@ server = Server(agent, tools=[...])
 | `AuthMiddleware(provider)` | Verifies tokens and sets `ctx.auth_token` |
 | `TimingMiddleware(log_level)` | Logs elapsed time per request |
 | `RateLimitMiddleware(max_rpm)` | Token-bucket rate limiter per session (default: 60 req/min) |
+| `A2AClientMiddleware(agents)` | Lets the agent delegate to remote A2A-compatible agents via tools |
+
+### Agent-to-Agent (A2A) Delegation
+
+Allow your agent to call other A2A-compatible agents over HTTP. Each remote agent becomes a tool the LLM can invoke.
+
+```python
+from fast_langchain_server import A2AClientMiddleware, RemoteAgentConfig
+from langchain.agents import create_agent
+
+# Option A: explicit config
+a2a = A2AClientMiddleware(agents=[
+    RemoteAgentConfig(
+        url="http://math-agent:8001",
+        name="math_agent",
+        description="Solves arithmetic and algebra problems.",
+    ),
+    RemoteAgentConfig(
+        url="http://search-agent:8002",
+        name="search_agent",
+        description="Searches the web for current information.",
+    ),
+])
+
+# Option B: auto-discover from agent cards
+a2a = await A2AClientMiddleware.discover(
+    "http://math-agent:8001",
+    "http://search-agent:8002",
+)
+
+agent = create_agent(model=model, tools=[...], middleware=[a2a])
+server = Server(agent, agent_name="orchestrator")
+```
+
+The middleware:
+- Adds a tool for each remote agent
+- Injects system prompts guiding when to delegate
+- Handles JSON-RPC 2.0 calls with automatic polling
+- Supports `session_id` for multi-turn conversations with remote agents
 
 ### Custom middleware
 
@@ -490,6 +529,7 @@ HTTP Request
 | `lifespan.py` | `@lifespan`, `ComposedLifespan`, `DEFAULT_LIFESPAN` |
 | `memory.py` | `LocalMemory`, `RedisMemory`, `NullMemory` |
 | `a2a.py` | A2A protocol, `LocalTaskManager`, JSON-RPC handlers |
+| `a2a_client.py` | `A2AClientMiddleware` — delegate to remote A2A agents |
 | `telemetry.py` | OpenTelemetry init and trace context propagation |
 | `cli.py` | `fast-langchain-server` CLI |
 
