@@ -24,6 +24,7 @@ Quick start
 
 from fast_langchain_server.server import Server
 from fast_langchain_server.serverutils import inspect_agent
+from fast_langchain_server.a2a_client import A2AClientMiddleware, RemoteAgentConfig
 from fast_langchain_server.context import AgentContext
 from fast_langchain_server.auth import (
     AuthToken,
@@ -60,6 +61,9 @@ __all__ = [
     # Server
     "Server",
     "inspect_agent",
+    # A2A client middleware
+    "A2AClientMiddleware",
+    "RemoteAgentConfig",
     # Context
     "AgentContext",
     # Auth
@@ -89,4 +93,4 @@ __all__ = [
     "all_of",
     "any_of",
 ]
-__version__ = "0.5.1"
+__version__ = "0.6.0"
